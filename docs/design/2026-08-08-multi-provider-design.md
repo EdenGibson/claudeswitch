@@ -219,9 +219,13 @@ TUI gains a provider column and a header showing the active backend.
    usual for a tool whose purpose is holding many accounts. Anthropic separately states it does not
    support routing Claude Code to non-Claude models through any gateway. Phase 1 carries none of
    this exposure. Phase 2 and 3 carry all of it.
-2. **The refresh flow is unverified.** The token endpoint usually rotates the refresh token, so a
-   failed write kills the login. Verify on a spare Codex account before the code touches the
-   primary one.
+2. **The refresh flow is unverified. STILL OPEN after Phase 1.** The token endpoint rotates the
+   refresh token, and OpenAI's tokens are single-use, so a failed write kills the login. Every test
+   for `codex.try_refresh` is mocked. The request shape now matches OpenAI's own client, checked
+   against `codex-rs/login/tests/suite/auth_refresh.rs`, but no live call has been made. Verify on
+   a spare Codex account under a separate `CODEX_HOME` before this code runs against the primary
+   one, and check specifically that the returned access token keeps `api.connectors.read` and
+   `api.connectors.invoke`.
 3. **Endpoint drift.** `wham/usage` and the Codex responses endpoint are undocumented. They can
    change without notice and break usage polling or the whole codex mode.
 4. **The router is a new single point of failure** for every Claude Code session on this box.
@@ -237,10 +241,38 @@ TUI gains a provider column and a header showing the active backend.
 
 ## Phasing
 
-**Phase 1 — provider seam and the Codex pool.** Extract the Claude adapter, add the Codex adapter,
-add the per-provider storage subtree, extend `list`, `add`, `switch`, `run`, `remove`, `alias` and
-the TUI. Usage polling and within-provider autoswitch for Codex. Ships a useful tool on its own,
-with no proxy and no terms exposure.
+**Phase 1 — provider seam and the Codex pool. Shipped 2026-08-08.** What landed:
+`providers/base.py` (the `Provider` Protocol and `AccountIdentity`), `providers/codex.py`,
+`codex_store.py`, `codex_cli.py`, and the per-provider storage subtree. The command surface is
+`cswap codex list|status|add|switch|remove`, with live usage polling through the existing
+`UsageStore`. 1912 tests pass; the branch adds 4900 lines and deletes none.
+
+Two deliberate departures from this document:
+
+- **No `providers/claude.py`.** Section 1 said the Claude paths would move behind the Protocol.
+  They did not. `switcher.py` is 5610 lines and takes most of upstream's ~30 commits a month, so
+  cutting a seam through it is the largest merge cost available, and nothing in Phase 1 consumes
+  two providers polymorphically. `git diff upstream/main -- src/claude_swap/switcher.py` is empty.
+  Write the Claude adapter when the TUI or the autoswitch engine first has to hold both at once.
+- **Deferred out of Phase 1:** `codex run` profiles (`$CODEX_HOME` holds `config.toml`, session
+  rollouts and sqlite state, so a profile has to mirror far more than `auth.json`), aliases,
+  directory mappings, autoswitch, the TUI, and macOS Keychain storage. The `spend` usage entry is
+  also absent: Codex `credits` carries a balance with no limit, so it cannot fill
+  `{used, limit, pct}` honestly.
+
+Two findings from Phase 1 that change how Phase 2 and 3 must be built:
+
+- **Switching must recapture the live credential before reading the stored one.** The Codex CLI
+  refreshes tokens in place, and OpenAI refresh tokens are single-use — reuse answers
+  `refresh_token_reused`. An early version of `switch` rolled the live file back when the target
+  slot was already live, and a later switch away then overwrote the good copy, leaving both dead.
+  Fixed in `c0b8fbe`, with a test.
+- **The refresh grant must not send `scope`.** OpenAI's own Codex client sends exactly
+  `client_id`, `grant_type` and `refresh_token`
+  (`codex-rs/login/tests/suite/auth_refresh.rs`). RFC 6749 §6 reads `scope` on a refresh as a
+  narrowing request, and the scope granted at authorize time is wider than the one this design
+  originally specified, so sending it risked a silent capability downgrade returned with no error.
+  Fixed in `be53ebf`.
 
 **Phase 2 — router.** `cswap router install|start|stop|status|uninstall`, the mode file, the
 verbatim Claude passthrough, the CLIProxyAPI handoff, and `cswap backend`.

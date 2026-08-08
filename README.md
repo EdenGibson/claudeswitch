@@ -197,6 +197,36 @@ cswap purge                     # Remove all claude-swap data
 
 The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working.
 
+### Codex accounts
+
+`cswap` also manages OpenAI Codex (ChatGPT subscription) accounts, as a pool independent of the
+Claude ones. Their state lives under `<backup directory>/providers/codex/` and nothing about the
+Claude accounts changes.
+
+```bash
+codex login                     # Log in as the account you want to add
+cswap codex add                 # Capture it into a slot
+cswap codex list                # Every Codex account, with live 5h/7d usage
+cswap codex list --no-usage     # Same, without the network call
+cswap codex list --json         # Machine-readable
+cswap codex switch 2            # Make slot 2 the live ~/.codex/auth.json
+cswap codex switch a@work.com   # Accounts resolve by email too
+cswap codex status              # Show the active Codex account
+cswap codex remove 2            # Forget an account (leaves your current login alone)
+```
+
+Quota comes from the same rate-limit windows the Codex CLI itself reports, so the 5-hour and
+weekly percentages line up with what `/status` shows inside Codex. A plan that reports no 5-hour
+window simply shows the weekly one.
+
+Switching saves the live credential back to its own slot first, because the Codex CLI refreshes
+tokens in place and OpenAI refresh tokens are single-use. Losing that write would eventually force
+a browser re-login.
+
+Not yet supported for Codex accounts: `run` profiles, aliases, directory mappings, auto-switch, the
+TUI dashboard, and macOS Keychain storage (Codex credentials use the file backend on every
+platform).
+
 ## Tips
 
 - **Do you need to restart after switching?** Usually not. On **Linux and Windows**, credentials are stored in a file and Claude Code re-reads them whenever that file changes, so the new account takes effect on your next message — no restart needed. On **macOS**, credentials live in the Keychain, which Claude Code caches for about 30 seconds; a running session picks up the switch once that cache expires. Restart Claude Code (or close and reopen the VS Code extension tab) only if you want the change to apply instantly.
@@ -220,6 +250,9 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 | Windows | File-based (inside the backup directory, under `credentials/`) | `~/.claude-swap-backup/` |
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
+
+Codex accounts live under the backup directory in `providers/codex/`, with the same
+`sequence.json` + `credentials/` layout and their own `cache/usage.json`.
 
 Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
 
