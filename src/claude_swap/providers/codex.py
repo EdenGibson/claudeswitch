@@ -287,8 +287,18 @@ def try_refresh(blob: str, timeout_s: float = REFRESH_TIMEOUT_S) -> RefreshOutco
         error = "invalid_grant" if exc.code in (400, 401) else "transient"
         _logger.warning("Codex refresh failed: http-%s", exc.code)
         return RefreshOutcome(None, error)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # OSError covers urllib.error.URLError and TimeoutError, which are both
+        # subclasses of it, and also the bare OSError or ConnectionResetError
+        # that resp.read() raises. urllib wraps a failure into URLError only at
+        # connect time, never at read time.
         _logger.warning("Codex refresh failed: %s", type(exc).__name__)
+        return RefreshOutcome(None, "transient")
+
+    if not isinstance(payload, dict):
+        _logger.warning(
+            "Codex refresh returned a %s, not an object", type(payload).__name__
+        )
         return RefreshOutcome(None, "transient")
 
     access_token = payload.get("access_token")

@@ -6,6 +6,8 @@ import json
 import urllib.error
 from unittest.mock import patch
 
+import pytest
+
 from claude_swap.providers import codex
 from tests.providers.conftest import make_codex_auth, make_jwt
 
@@ -109,3 +111,72 @@ def test_a_response_missing_an_access_token_is_transient_and_writes_nothing():
         outcome = codex.try_refresh(make_codex_auth())
     assert outcome.credentials is None
     assert outcome.error == "transient"
+
+
+def _raw_response(raw: bytes):
+    class _Resp:
+        def read(self):
+            return raw
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    return _Resp()
+
+
+@pytest.mark.parametrize("raw", [b"[1, 2, 3]", b"null", b'"a string"'])
+def test_a_payload_that_is_not_an_object_is_transient(raw: bytes):
+    """try_refresh promises a RefreshOutcome for every failure."""
+    with patch("urllib.request.urlopen", lambda req, timeout=None: _raw_response(raw)):
+        outcome = codex.try_refresh(make_codex_auth())
+    assert outcome.credentials is None
+    assert outcome.error == "transient"
+
+
+def test_an_invalid_utf8_body_is_transient():
+    with patch(
+        "urllib.request.urlopen", lambda req, timeout=None: _raw_response(b"\xff\xfe\x00")
+    ):
+        outcome = codex.try_refresh(make_codex_auth())
+    assert outcome.credentials is None
+    assert outcome.error == "transient"
+
+
+@pytest.mark.parametrize(
+    "exc", [ConnectionResetError("reset by peer"), OSError("read failed")]
+)
+def test_a_read_failure_is_transient(exc: OSError):
+    class _Resp:
+        def read(self):
+            raise exc
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    with patch("urllib.request.urlopen", lambda req, timeout=None: _Resp()):
+        outcome = codex.try_refresh(make_codex_auth())
+    assert outcome.credentials is None
+    assert outcome.error == "transient"
+
+
+def test_a_successful_refresh_does_not_mutate_the_input():
+    original = make_codex_auth(refresh_token="old-refresh")
+    unchanged = str(original)
+    with patch(
+        "urllib.request.urlopen",
+        lambda req, timeout=None: _grant_response({
+            "access_token": make_jwt({"exp": 9_999_999_999}),
+            "refresh_token": "new-refresh",
+        }),
+    ):
+        outcome = codex.try_refresh(original)
+
+    assert outcome.error is None
+    assert original == unchanged
+    assert json.loads(outcome.credentials)["tokens"]["refresh_token"] == "new-refresh"
