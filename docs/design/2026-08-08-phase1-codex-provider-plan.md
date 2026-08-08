@@ -115,7 +115,7 @@ def test_identity_is_hashable_and_frozen():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/providers/test_base.py -p no:xdist -q`
+Run: `uv run pytest tests/providers/test_base.py -q`
 Expected: FAIL, `ModuleNotFoundError: No module named 'claude_swap.providers'`
 
 - [ ] **Step 3: Write the implementation**
@@ -219,7 +219,7 @@ __all__ = ["AccountIdentity", "Provider"]
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/providers/test_base.py -p no:xdist -q`
+Run: `uv run pytest tests/providers/test_base.py -q`
 Expected: PASS, 3 passed
 
 - [ ] **Step 5: Commit**
@@ -400,7 +400,7 @@ def test_identity_of_garbage_is_none():
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `uv run pytest tests/providers/test_codex_identity.py -p no:xdist -q`
+Run: `uv run pytest tests/providers/test_codex_identity.py -q`
 Expected: FAIL, `ImportError: cannot import name 'codex'`
 
 - [ ] **Step 4: Write the implementation**
@@ -513,7 +513,7 @@ def identity(blob: str) -> AccountIdentity | None:
 
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `uv run pytest tests/providers/test_codex_identity.py -p no:xdist -q`
+Run: `uv run pytest tests/providers/test_codex_identity.py -q`
 Expected: PASS, 4 passed
 
 - [ ] **Step 6: Commit**
@@ -571,7 +571,7 @@ def test_unreadable_blob_is_not_reported_expired():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/providers/test_codex_identity.py -p no:xdist -q`
+Run: `uv run pytest tests/providers/test_codex_identity.py -q`
 Expected: FAIL, `AttributeError: module 'claude_swap.providers.codex' has no attribute 'fingerprint'`
 
 - [ ] **Step 3: Write the implementation**
@@ -631,7 +631,7 @@ function; it is written inline above only to keep the appended hunk self-contain
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/providers/test_codex_identity.py -p no:xdist -q`
+Run: `uv run pytest tests/providers/test_codex_identity.py -q`
 Expected: PASS, 9 passed
 
 - [ ] **Step 5: Commit**
@@ -814,7 +814,7 @@ def test_fetch_usage_propagates_http_errors():
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `uv run pytest tests/providers/test_codex_usage.py -p no:xdist -q`
+Run: `uv run pytest tests/providers/test_codex_usage.py -q`
 Expected: FAIL, `AttributeError: module 'claude_swap.providers.codex' has no attribute 'build_usage_result'`
 
 - [ ] **Step 4: Write the implementation**
@@ -926,7 +926,7 @@ from claude_swap.oauth import format_reset
 
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `uv run pytest tests/providers/test_codex_usage.py -p no:xdist -q`
+Run: `uv run pytest tests/providers/test_codex_usage.py -q`
 Expected: PASS, 8 passed
 
 - [ ] **Step 6: Commit**
@@ -1070,7 +1070,7 @@ def test_a_response_missing_an_access_token_is_transient_and_writes_nothing():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/providers/test_codex_refresh.py -p no:xdist -q`
+Run: `uv run pytest tests/providers/test_codex_refresh.py -q`
 Expected: FAIL, `AttributeError: module 'claude_swap.providers.codex' has no attribute 'try_refresh'`
 
 - [ ] **Step 3: Write the implementation**
@@ -1166,7 +1166,7 @@ from claude_swap.oauth import RefreshOutcome
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/providers/test_codex_refresh.py -p no:xdist -q`
+Run: `uv run pytest tests/providers/test_codex_refresh.py -q`
 Expected: PASS, 6 passed
 
 - [ ] **Step 5: Commit**
@@ -1225,7 +1225,7 @@ def test_provider_root_rejects_a_traversing_name(temp_home: Path):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/test_codex_paths.py -p no:xdist -q`
+Run: `uv run pytest tests/test_codex_paths.py -q`
 Expected: FAIL, `AttributeError: module 'claude_swap.paths' has no attribute 'get_codex_home'`
 
 - [ ] **Step 3: Write the implementation**
@@ -1270,7 +1270,7 @@ Add `import re` to the module's top-level imports.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/test_codex_paths.py -p no:xdist -q`
+Run: `uv run pytest tests/test_codex_paths.py -q`
 Expected: PASS, 5 passed
 
 - [ ] **Step 5: Commit**
@@ -1347,7 +1347,7 @@ def test_next_slot_on_an_empty_store_is_one(store: CodexAccountStore):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/test_codex_store.py -p no:xdist -q`
+Run: `uv run pytest tests/test_codex_store.py -q`
 Expected: FAIL, `ModuleNotFoundError: No module named 'claude_swap.codex_store'`
 
 - [ ] **Step 3: Write the implementation**
@@ -1455,7 +1455,7 @@ class CodexAccountStore:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/test_codex_store.py -p no:xdist -q`
+Run: `uv run pytest tests/test_codex_store.py -q`
 Expected: PASS, 5 passed
 
 - [ ] **Step 5: Commit**
@@ -1513,7 +1513,7 @@ def test_deleting_a_credential_is_idempotent(store: CodexAccountStore):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/test_codex_store.py -p no:xdist -q`
+Run: `uv run pytest tests/test_codex_store.py -q`
 Expected: FAIL, `AttributeError: 'CodexAccountStore' object has no attribute 'write_credential'`
 
 - [ ] **Step 3: Write the implementation**
@@ -1570,7 +1570,7 @@ Append to `CodexAccountStore` in `src/claude_swap/codex_store.py`:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/test_codex_store.py -p no:xdist -q`
+Run: `uv run pytest tests/test_codex_store.py -q`
 Expected: PASS, 10 passed
 
 - [ ] **Step 5: Commit**
@@ -1727,7 +1727,7 @@ def test_removing_a_non_active_account_leaves_the_active_pointer(
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/test_codex_store.py -p no:xdist -q`
+Run: `uv run pytest tests/test_codex_store.py -q`
 Expected: FAIL, `AttributeError: 'CodexAccountStore' object has no attribute 'add_current'`
 
 - [ ] **Step 3: Write the implementation**
@@ -1892,7 +1892,7 @@ from claude_swap.providers.base import AccountIdentity
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/test_codex_store.py -p no:xdist -q`
+Run: `uv run pytest tests/test_codex_store.py -q`
 Expected: PASS, 20 passed
 
 - [ ] **Step 5: Commit**
@@ -2018,7 +2018,7 @@ def test_usage_entries_are_returned_for_accounts_never_fetched(
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/test_codex_store.py -p no:xdist -q`
+Run: `uv run pytest tests/test_codex_store.py -q`
 Expected: FAIL, `AttributeError: 'CodexAccountStore' object has no attribute 'collect_usage'`
 
 - [ ] **Step 3: Write the implementation**
@@ -2110,7 +2110,7 @@ from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore, with_se
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/test_codex_store.py -p no:xdist -q`
+Run: `uv run pytest tests/test_codex_store.py -q`
 Expected: PASS, 25 passed
 
 - [ ] **Step 5: Commit**
@@ -2257,7 +2257,7 @@ def test_main_dispatches_the_codex_namespace(temp_home: Path, monkeypatch):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/test_codex_cli.py -p no:xdist -q`
+Run: `uv run pytest tests/test_codex_cli.py -q`
 Expected: FAIL, `ModuleNotFoundError: No module named 'claude_swap.codex_cli'`
 
 - [ ] **Step 3: Write the implementation**
@@ -2457,7 +2457,7 @@ And add one line to the `description` block of the parser, after the `cswap auto
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/test_codex_cli.py -p no:xdist -q`
+Run: `uv run pytest tests/test_codex_cli.py -q`
 Expected: PASS, 10 passed
 
 - [ ] **Step 5: Run the whole suite to prove Claude behaviour is unchanged**
