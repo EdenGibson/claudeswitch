@@ -16,8 +16,10 @@ Endpoint notes, all confirmed against a live account on 2026-08-08:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
+import time
 
 from claude_swap.providers.base import AccountIdentity
 
@@ -98,3 +100,48 @@ def identity(blob: str) -> AccountIdentity | None:
         org_name=org_name,
         plan=str(plan),
     )
+
+
+#: Treat a token expiring inside this window as already expired. Matches
+#: oauth.OAUTH_EXPIRY_BUFFER_MS so both providers behave the same.
+EXPIRY_BUFFER_S = 5 * 60
+
+
+def fingerprint(blob: str) -> str | None:
+    """Stable lineage id for a credential.
+
+    Hashes the refresh token, which survives access-token rotation, so two
+    generations of the same login compare equal. None only for input that
+    carries no refresh token at all.
+    """
+    tokens = _tokens(blob)
+    if not tokens:
+        return None
+    refresh = tokens.get("refresh_token")
+    if not isinstance(refresh, str) or not refresh:
+        return None
+    return "sha256:" + hashlib.sha256(refresh.encode("utf-8")).hexdigest()
+
+
+def access_token_expires_at(blob: str) -> float | None:
+    """Unix seconds at which the access token expires, or None if unreadable."""
+    tokens = _tokens(blob)
+    if not tokens:
+        return None
+    claims = _decode_jwt_payload(tokens.get("access_token"))
+    if not isinstance(claims, dict):
+        return None
+    exp = claims.get("exp")
+    return float(exp) if isinstance(exp, (int, float)) else None
+
+
+def is_expired(blob: str) -> bool:
+    """Whether the access token is expired or expires within the buffer.
+
+    An unreadable blob answers False. Unknown must not read as expired, or a
+    parse failure would drive a refresh of a credential that was fine.
+    """
+    expires_at = access_token_expires_at(blob)
+    if expires_at is None:
+        return False
+    return time.time() + EXPIRY_BUFFER_S >= expires_at

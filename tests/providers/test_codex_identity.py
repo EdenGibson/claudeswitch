@@ -53,3 +53,36 @@ def test_identity_of_garbage_is_none():
     assert codex.identity("not json") is None
     assert codex.identity(json.dumps({"tokens": {}})) is None
     assert codex.identity(json.dumps({"tokens": {"id_token": "a.b"}})) is None
+
+
+def test_fingerprint_tracks_the_refresh_token_only():
+    a = make_codex_auth(refresh_token="same", access_expires_in=864000)
+    b = make_codex_auth(refresh_token="same", access_expires_in=100)
+    c = make_codex_auth(refresh_token="different")
+    assert codex.fingerprint(a) == codex.fingerprint(b)
+    assert codex.fingerprint(a) != codex.fingerprint(c)
+
+
+def test_fingerprint_of_garbage_is_none():
+    assert codex.fingerprint("") is None
+    assert codex.fingerprint("not json") is None
+
+
+def test_expiry_reads_the_access_token_exp():
+    fresh = make_codex_auth(access_expires_in=864_000)
+    assert codex.is_expired(fresh) is False
+
+    stale = make_codex_auth(access_expires_in=-1)
+    assert codex.is_expired(stale) is True
+
+
+def test_expiry_buffer_treats_an_imminent_expiry_as_expired():
+    """Five minutes of headroom, matching oauth.OAUTH_EXPIRY_BUFFER_MS."""
+    soon = make_codex_auth(access_expires_in=60)
+    assert codex.is_expired(soon) is True
+
+
+def test_unreadable_blob_is_not_reported_expired():
+    """Unknown must not read as expired, or a bad parse triggers a refresh
+    storm against a credential that was fine."""
+    assert codex.is_expired("not json") is False
