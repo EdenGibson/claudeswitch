@@ -240,6 +240,8 @@ def get_provider_root(provider: str) -> Path:
     Claude keeps the backup root itself, unchanged, so existing installs need
     no migration. Every other provider gets ``<backup_root>/providers/<name>``.
     """
-    if not _PROVIDER_NAME_RE.match(provider):
+    # fullmatch, not match: "$" also matches before a final newline, so
+    # "codex\n" passed and resolved to a different directory than "codex".
+    if not _PROVIDER_NAME_RE.fullmatch(provider):
         raise ValueError(f"invalid provider name: {provider!r}")
     return get_backup_root() / "providers" / provider

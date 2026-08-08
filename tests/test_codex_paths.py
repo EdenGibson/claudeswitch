@@ -30,3 +30,12 @@ def test_provider_root_rejects_a_traversing_name(temp_home: Path):
 
     with pytest.raises(ValueError):
         paths.get_provider_root("../escape")
+
+
+def test_provider_root_rejects_a_trailing_newline(temp_home: Path):
+    """re.match lets "$" match before a final newline, so "codex\\n" passed
+    and resolved to a different directory than "codex"."""
+    import pytest
+
+    with pytest.raises(ValueError):
+        paths.get_provider_root("codex\n")
