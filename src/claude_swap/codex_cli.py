@@ -66,7 +66,10 @@ def _usage_summary(entry) -> str:
         window = usage.get(key)
         if not isinstance(window, dict):
             continue
-        text = f"{label} {window['pct']:.0f}%"
+        pct = window.get("pct")
+        if not isinstance(pct, (int, float)):
+            continue
+        text = f"{label} {pct:.0f}%"
         reset = fresh_reset_strings(window)
         if reset:
             text += f" (resets {reset[0]})"
@@ -79,7 +82,10 @@ def _cmd_list(store: CodexAccountStore, args: argparse.Namespace) -> None:
     active = store.active_number()
 
     if args.json:
-        entries = store.usage_entries()
+        # --json honours --no-usage exactly as the human-readable path does. A
+        # scripting caller that asks for usage must not silently get whatever
+        # happened to be cached.
+        entries = store.usage_entries() if args.no_usage else store.collect_usage()
         print(json.dumps({
             "provider": "codex",
             "activeSlot": active,
@@ -168,4 +174,9 @@ def codex_command(argv: list[str]) -> None:
             _cmd_remove(store, args)
     except ValueError as exc:
         printer.error(str(exc))
+        sys.exit(1)
+    except OSError as exc:
+        # A read-only home, a full disk, a permission problem. The user needs
+        # the reason, not a traceback.
+        printer.error(f"Codex account storage failed: {exc}")
         sys.exit(1)
