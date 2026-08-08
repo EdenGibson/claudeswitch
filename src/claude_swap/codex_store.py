@@ -335,6 +335,18 @@ class CodexAccountStore:
             for slot, record in self.accounts()
         }
 
+    def _live_belongs_to(self, account_id: str) -> bool:
+        """Whether the live credential is this account's.
+
+        A user can run ``codex login`` outside cswap, so the live file need not
+        hold whatever ``activeAccountNumber`` names.
+        """
+        live = self.read_live()
+        if not live:
+            return False
+        ident = codex.identity(live)
+        return ident is not None and ident.account_uuid == account_id
+
     def _usage_store(self) -> UsageStore:
         self.ensure_dirs()
         return UsageStore(self.cache_dir)
@@ -351,21 +363,29 @@ class CodexAccountStore:
         the next poll would repeat it. A dead refresh lineage is surfaced as the
         ``token expired`` sentinel rather than a fetch error, so the UI can say
         what the user must actually do.
+
+        For the live account the live file is both the source and a target.
+        OpenAI refresh tokens are single-use, so refreshing the stored copy
+        spends the token the live file still holds. Reading the stale copy would
+        burn the poll, and not writing the new one back would leave the Codex
+        CLI holding a token that now answers ``refresh_token_reused``.
         """
         usage_store = self._usage_store()
         identities = self._identities()
         entries = usage_store.entries(identities)
+        active = self.active_number()
         now = time.time()
 
         outcomes: dict[str, FetchRecord] = {}
         sentinels: dict[str, str] = {}
 
-        for slot, (email, _account_id) in identities.items():
+        for slot, (email, account_id) in identities.items():
             entry = entries.get(slot)
             if not force and entry is not None and entry.fresh(now):
                 continue
 
-            blob = self.read_credential(slot, email)
+            live_owned = slot == active and self._live_belongs_to(account_id)
+            blob = self.read_live() if live_owned else self.read_credential(slot, email)
             if not blob:
                 continue
 
@@ -377,6 +397,8 @@ class CodexAccountStore:
                     continue
                 blob = refreshed.credentials
                 self.write_credential(slot, email, blob)
+                if live_owned:
+                    self.write_live(blob)
 
             try:
                 usage = codex.fetch_usage(blob)

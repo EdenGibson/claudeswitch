@@ -11,6 +11,7 @@ import pytest
 
 from claude_swap import paths
 from claude_swap.codex_store import CodexAccountStore
+from claude_swap.oauth import RefreshOutcome
 from claude_swap.usage_store import UsageEntry
 from tests.providers.conftest import make_codex_auth
 
@@ -381,3 +382,125 @@ def test_usage_entries_are_returned_for_accounts_never_fetched(
     assert set(entries) == {"1", "2"}
     assert all(isinstance(e, UsageEntry) for e in entries.values())
     assert entries["1"].last_good is None
+
+
+def test_collect_usage_writes_a_refreshed_live_token_back_to_the_live_file(
+    store: CodexAccountStore, temp_home: Path
+):
+    """OpenAI refresh tokens are single-use. Refreshing the stored copy spends
+    the token the live file holds, so the new one must land there too."""
+    _write_live(
+        temp_home,
+        make_codex_auth(
+            email="a@example.com",
+            account_id="acc-a",
+            refresh_token="v1",
+            access_expires_in=-5,
+        ),
+    )
+    store.add_current()
+
+    rotated = make_codex_auth(
+        email="a@example.com", account_id="acc-a", refresh_token="v2-ROTATED"
+    )
+    with patch(
+        "claude_swap.providers.codex.try_refresh",
+        return_value=RefreshOutcome(rotated, None),
+    ):
+        with patch(
+            "claude_swap.providers.codex.fetch_usage",
+            return_value={"seven_day": {"pct": 1.0}},
+        ):
+            store.collect_usage(force=True)
+
+    live = (temp_home / ".codex" / "auth.json").read_text()
+    assert json.loads(live)["tokens"]["refresh_token"] == "v2-ROTATED"
+    stored = store.read_credential("1", "a@example.com")
+    assert json.loads(stored)["tokens"]["refresh_token"] == "v2-ROTATED"
+
+
+def test_collect_usage_leaves_the_live_file_alone_for_an_inactive_slot(
+    store: CodexAccountStore, temp_home: Path
+):
+    _write_live(
+        temp_home,
+        make_codex_auth(email="a@example.com", account_id="acc-a", access_expires_in=-5),
+    )
+    store.add_current()
+    _write_live(
+        temp_home, make_codex_auth(email="b@example.com", account_id="acc-b")
+    )
+    store.add_current()
+    before = (temp_home / ".codex" / "auth.json").read_text()
+
+    fresh_a = make_codex_auth(
+        email="a@example.com", account_id="acc-a", refresh_token="a-v2"
+    )
+    with patch(
+        "claude_swap.providers.codex.try_refresh",
+        return_value=RefreshOutcome(fresh_a, None),
+    ):
+        with patch(
+            "claude_swap.providers.codex.fetch_usage",
+            return_value={"seven_day": {"pct": 1.0}},
+        ):
+            store.collect_usage(force=True)
+
+    assert (temp_home / ".codex" / "auth.json").read_text() == before
+    assert json.loads(store.read_credential("1", "a@example.com"))["tokens"][
+        "refresh_token"
+    ] == "a-v2"
+
+
+def test_collect_usage_reads_the_live_file_for_the_active_slot(
+    store: CodexAccountStore, temp_home: Path
+):
+    """The Codex CLI rotates in place, so the stored copy can be stale. Polling
+    the stale one would spend a token that is already dead."""
+    _write_live(
+        temp_home, make_codex_auth(email="a@example.com", account_id="acc-a", refresh_token="v1")
+    )
+    store.add_current()
+    _write_live(
+        temp_home,
+        make_codex_auth(email="a@example.com", account_id="acc-a", refresh_token="v2-BY-CODEX"),
+    )
+
+    seen = {}
+
+    def _capture(blob):
+        seen["refresh_token"] = json.loads(blob)["tokens"]["refresh_token"]
+        return {"seven_day": {"pct": 1.0}}
+
+    with patch("claude_swap.providers.codex.fetch_usage", side_effect=_capture):
+        store.collect_usage(force=True)
+
+    assert seen["refresh_token"] == "v2-BY-CODEX"
+
+
+def test_collect_usage_ignores_a_live_file_owned_by_another_account(
+    store: CodexAccountStore, temp_home: Path
+):
+    """A user can run 'codex login' outside cswap. The live file then belongs to
+    nobody cswap tracks, and the stored copy must win."""
+    _write_live(
+        temp_home, make_codex_auth(email="a@example.com", account_id="acc-a", refresh_token="v1")
+    )
+    store.add_current()
+    _write_live(
+        temp_home,
+        make_codex_auth(email="z@example.com", account_id="acc-z", refresh_token="stranger"),
+    )
+    before = (temp_home / ".codex" / "auth.json").read_text()
+
+    seen = {}
+
+    def _capture(blob):
+        seen["refresh_token"] = json.loads(blob)["tokens"]["refresh_token"]
+        return {"seven_day": {"pct": 1.0}}
+
+    with patch("claude_swap.providers.codex.fetch_usage", side_effect=_capture):
+        store.collect_usage(force=True)
+
+    assert seen["refresh_token"] == "v1"
+    assert (temp_home / ".codex" / "auth.json").read_text() == before
