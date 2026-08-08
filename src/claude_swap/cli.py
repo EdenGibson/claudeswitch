@@ -890,6 +890,11 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+    if argv and argv[0] == "codex":
+        from claude_swap.codex_cli import codex_command
+
+        codex_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -929,6 +934,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s codex <cmd>                manage Codex (ChatGPT) accounts
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
