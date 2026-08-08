@@ -20,7 +20,10 @@ import hashlib
 import json
 import logging
 import time
+import urllib.request
+from datetime import datetime, timezone
 
+from claude_swap.oauth import format_reset
 from claude_swap.providers.base import AccountIdentity
 
 _logger = logging.getLogger("claude-swap")
@@ -145,3 +148,96 @@ def is_expired(blob: str) -> bool:
     if expires_at is None:
         return False
     return time.time() + EXPIRY_BUFFER_S >= expires_at
+
+
+#: Window length in seconds -> the normalized key cswap already uses.
+#: Anything else becomes a ``scoped`` entry named by its length in hours, so a
+#: new window the provider adds is surfaced rather than silently dropped.
+_WINDOW_KEYS = {18000: "five_hour", 604800: "seven_day"}
+
+USAGE_TIMEOUT_S = 5.0
+
+
+def _window_entry(window: object) -> tuple[str, dict] | None:
+    """``(key, entry)`` for one API window, or None when it carries no data."""
+    if not isinstance(window, dict):
+        return None
+    pct = window.get("used_percent")
+    if not isinstance(pct, (int, float)):
+        return None
+    length = window.get("limit_window_seconds")
+    if not isinstance(length, int):
+        return None
+
+    entry: dict = {"pct": float(pct)}
+    reset_at = window.get("reset_at")
+    if isinstance(reset_at, (int, float)):
+        resets_at = datetime.fromtimestamp(reset_at, tz=timezone.utc).isoformat()
+        entry["resets_at"] = resets_at
+        entry["countdown"], entry["clock"] = format_reset(resets_at)
+
+    key = _WINDOW_KEYS.get(length)
+    if key is None:
+        entry["name"] = f"{length // 3600}h"
+        return "scoped", entry
+    return key, entry
+
+
+def build_usage_result(data: dict) -> dict | None:
+    """Normalize a ``wham/usage`` body into cswap's usage shape.
+
+    Windows are matched on their length, never on which slot the API put them
+    in: the live account reports the weekly window as ``primary_window`` while
+    other plans report the 5-hour one there.
+
+    ``credits`` is deliberately not mapped. It carries a balance with no limit,
+    so it cannot fill the ``spend`` entry's ``{used, limit, pct}`` honestly.
+    """
+    _logger.debug("Codex usage response: %s", json.dumps(data, indent=2))
+    rate_limit = data.get("rate_limit") if isinstance(data, dict) else None
+    if not isinstance(rate_limit, dict):
+        return None
+
+    result: dict = {}
+    scoped: list[dict] = []
+    for slot in ("primary_window", "secondary_window"):
+        mapped = _window_entry(rate_limit.get(slot))
+        if mapped is None:
+            continue
+        key, entry = mapped
+        if key == "scoped":
+            scoped.append(entry)
+        else:
+            result[key] = entry
+    if scoped:
+        result["scoped"] = scoped
+    return result or None
+
+
+def request_usage_data(access_token: str, account_id: str) -> dict:
+    """Raw ``wham/usage`` body. Raises on any HTTP or transport failure."""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "chatgpt-account-id": account_id,
+        "User-Agent": "claude-swap/1.0",
+    }
+    req = urllib.request.Request(USAGE_URL, headers=headers)
+    with urllib.request.urlopen(req, timeout=USAGE_TIMEOUT_S) as resp:
+        return json.loads(resp.read().decode())
+
+
+def fetch_usage(blob: str) -> dict | None:
+    """Normalized usage for one credential blob.
+
+    Raises whatever ``request_usage_data`` raises, so the caller can classify
+    the failure with ``oauth._classify_usage_error`` exactly as it does for
+    Claude.
+    """
+    tokens = _tokens(blob)
+    if not tokens:
+        return None
+    access_token = tokens.get("access_token")
+    account_id = tokens.get("account_id") or ""
+    if not isinstance(access_token, str) or not access_token:
+        return None
+    return build_usage_result(request_usage_data(access_token, str(account_id)))
