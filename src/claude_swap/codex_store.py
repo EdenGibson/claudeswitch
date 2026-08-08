@@ -12,14 +12,17 @@ implemented for this provider.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import paths
+from claude_swap.fsutil import replace_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.settings import atomic_write_json
 
@@ -92,3 +95,47 @@ class CodexAccountStore:
         while candidate in taken:
             candidate += 1
         return str(candidate)
+
+    # -- credential backups -------------------------------------------------
+
+    def credential_path(self, slot: str, email: str) -> Path:
+        """Backup file for one slot. Named like the Claude ones."""
+        return self.credentials_dir / f".creds-{slot}-{email}.enc"
+
+    def write_credential(self, slot: str, email: str, blob: str) -> None:
+        """Atomically store a credential, base64-encoded, mode 0600."""
+        self.ensure_dirs()
+        target = self.credential_path(slot, email)
+        encoded = base64.b64encode(blob.encode("utf-8"))
+        fd, tmp_path = tempfile.mkstemp(dir=str(self.credentials_dir), suffix=".tmp")
+        try:
+            os.write(fd, encoded)
+            os.close(fd)
+            fd = -1
+            replace_with_retry(tmp_path, str(target))
+            if sys.platform != "win32":
+                os.chmod(str(target), 0o600)
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def read_credential(self, slot: str, email: str) -> str:
+        """The stored credential, or an empty string when absent or corrupt."""
+        try:
+            encoded = self.credential_path(slot, email).read_bytes()
+        except OSError:
+            return ""
+        try:
+            return base64.b64decode(encoded).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            _logger.warning("Codex credential for slot %s is unreadable", slot)
+            return ""
+
+    def delete_credential(self, slot: str, email: str) -> None:
+        """Remove a stored credential. Absent is not an error."""
+        self.credential_path(slot, email).unlink(missing_ok=True)
