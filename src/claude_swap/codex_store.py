@@ -24,6 +24,8 @@ from pathlib import Path
 from claude_swap import paths
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.locking import FileLock
+from claude_swap.providers import codex
+from claude_swap.providers.base import AccountIdentity
 from claude_swap.settings import atomic_write_json
 
 PROVIDER = "codex"
@@ -139,3 +141,148 @@ class CodexAccountStore:
     def delete_credential(self, slot: str, email: str) -> None:
         """Remove a stored credential. Absent is not an error."""
         self.credential_path(slot, email).unlink(missing_ok=True)
+
+    # -- the live credential ------------------------------------------------
+
+    def live_path(self) -> Path:
+        """Where the Codex CLI reads its credential."""
+        return paths.get_codex_auth_path()
+
+    def read_live(self) -> str:
+        """The live credential, or an empty string when absent."""
+        try:
+            return self.live_path().read_text(encoding="utf-8")
+        except OSError:
+            return ""
+
+    def write_live(self, blob: str) -> None:
+        """Atomically replace the live credential, mode 0600."""
+        target = self.live_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
+        try:
+            os.write(fd, blob.encode("utf-8"))
+            os.close(fd)
+            fd = -1
+            replace_with_retry(tmp_path, str(target))
+            if sys.platform != "win32":
+                os.chmod(str(target), 0o600)
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    # -- resolution ---------------------------------------------------------
+
+    def resolve(self, identifier: str) -> tuple[str, dict]:
+        """``(slot, record)`` for a slot number or an email address.
+
+        Raises ValueError naming the identifier when nothing matches.
+        """
+        rows = self._read_sequence()["accounts"]
+        if identifier in rows:
+            return identifier, rows[identifier]
+        wanted = identifier.strip().lower()
+        for slot, record in sorted(rows.items(), key=lambda kv: int(kv[0])):
+            if str(record.get("email", "")).lower() == wanted:
+                return slot, record
+        raise ValueError(f"No Codex account matches '{identifier}'")
+
+    # -- mutations ----------------------------------------------------------
+
+    def _recapture_active(self, data: dict) -> None:
+        """Save the live credential back into the slot that owns it.
+
+        The Codex CLI refreshes tokens in place. Without this, switching away
+        discards that rotation and a later switch back restores a stale token.
+        Mutates nothing when the live credential belongs to no known slot.
+        """
+        live = self.read_live()
+        if not live:
+            return
+        ident = codex.identity(live)
+        if ident is None:
+            return
+        for slot, record in data["accounts"].items():
+            if record.get("accountId") == ident.account_uuid:
+                self.write_credential(slot, str(record.get("email", "")), live)
+                return
+
+    def add_current(self) -> tuple[str, AccountIdentity]:
+        """Capture the live credential into a new slot and make it active.
+
+        Raises ValueError when nothing is logged in, when the credential is
+        unreadable, or when the account is already managed.
+        """
+        live = self.read_live()
+        if not live:
+            raise ValueError(
+                f"No Codex credential at {self.live_path()}. Run 'codex login' first."
+            )
+        ident = codex.identity(live)
+        if ident is None:
+            raise ValueError(f"Could not read a Codex account from {self.live_path()}")
+
+        with self._lock():
+            data = self._read_sequence()
+            for slot, record in data["accounts"].items():
+                if record.get("accountId") == ident.account_uuid:
+                    raise ValueError(
+                        f"{ident.email} is already managed in slot {slot}"
+                    )
+            slot = self.next_slot()
+            data["accounts"][slot] = {
+                "email": ident.email,
+                "accountId": ident.account_uuid,
+                "organizationUuid": ident.org_uuid,
+                "organizationName": ident.org_name,
+                "plan": ident.plan,
+                "added": _timestamp(),
+            }
+            data["activeAccountNumber"] = int(slot)
+            self.write_credential(slot, ident.email, live)
+            self._write_sequence(data)
+        return slot, ident
+
+    def switch(self, identifier: str) -> tuple[str, str]:
+        """Make an account live. Returns ``(slot, email)``.
+
+        Raises ValueError when the account is unknown or its stored credential
+        is missing.
+        """
+        with self._lock():
+            data = self._read_sequence()
+            slot, record = self.resolve(identifier)
+            email = str(record.get("email", ""))
+            blob = self.read_credential(slot, email)
+            if not blob:
+                raise ValueError(
+                    f"No stored credential for slot {slot} ({email}). "
+                    f"Re-add it with 'cswap codex add'."
+                )
+            self._recapture_active(data)
+            self.write_live(blob)
+            data["activeAccountNumber"] = int(slot)
+            self._write_sequence(data)
+        return slot, email
+
+    def remove(self, identifier: str) -> tuple[str, str]:
+        """Forget an account and delete its stored credential.
+
+        Returns ``(slot, email)``. The live ``auth.json`` is left alone: this
+        removes cswap's copy, never the user's current login.
+        """
+        with self._lock():
+            data = self._read_sequence()
+            slot, record = self.resolve(identifier)
+            email = str(record.get("email", ""))
+            del data["accounts"][slot]
+            if str(data.get("activeAccountNumber")) == slot:
+                data.pop("activeAccountNumber", None)
+            self.delete_credential(slot, email)
+            self._write_sequence(data)
+        return slot, email

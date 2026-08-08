@@ -81,3 +81,130 @@ def test_deleting_a_credential_is_idempotent(store: CodexAccountStore):
     store.delete_credential("1", "d@example.com")
     store.delete_credential("1", "d@example.com")
     assert store.read_credential("1", "d@example.com") == ""
+
+
+def _write_live(temp_home: Path, blob: str) -> Path:
+    live = temp_home / ".codex" / "auth.json"
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.write_text(blob, encoding="utf-8")
+    return live
+
+
+def test_add_captures_the_live_credential_into_slot_one(
+    store: CodexAccountStore, temp_home: Path
+):
+    _write_live(temp_home, make_codex_auth(email="first@example.com", account_id="acc-1"))
+    slot, ident = store.add_current()
+    assert slot == "1"
+    assert ident.email == "first@example.com"
+    assert store.active_number() == "1"
+    assert store.read_credential("1", "first@example.com")
+
+
+def test_add_records_the_identity_fields(store: CodexAccountStore, temp_home: Path):
+    _write_live(
+        temp_home,
+        make_codex_auth(
+            email="rec@example.com", account_id="acc-9", plan="pro", org_title="Derive"
+        ),
+    )
+    store.add_current()
+    record = dict(store.accounts())["1"]
+    assert record["email"] == "rec@example.com"
+    assert record["accountId"] == "acc-9"
+    assert record["plan"] == "pro"
+    assert record["organizationName"] == "Derive"
+    assert record["added"]
+
+
+def test_add_refuses_a_duplicate_account(store: CodexAccountStore, temp_home: Path):
+    _write_live(temp_home, make_codex_auth(email="dup@example.com", account_id="acc-d"))
+    store.add_current()
+    with pytest.raises(ValueError, match="already managed"):
+        store.add_current()
+
+
+def test_add_refuses_when_no_live_credential_exists(store: CodexAccountStore):
+    with pytest.raises(ValueError, match="No Codex credential"):
+        store.add_current()
+
+
+def test_switch_writes_the_target_credential_live(
+    store: CodexAccountStore, temp_home: Path
+):
+    _write_live(temp_home, make_codex_auth(email="a@example.com", account_id="acc-a"))
+    store.add_current()
+    _write_live(temp_home, make_codex_auth(email="b@example.com", account_id="acc-b"))
+    store.add_current()
+
+    store.switch("1")
+
+    live = json.loads((temp_home / ".codex" / "auth.json").read_text())
+    assert live["tokens"]["account_id"] == "acc-a"
+    assert store.active_number() == "1"
+
+
+def test_switch_recaptures_the_live_credential_before_replacing_it(
+    store: CodexAccountStore, temp_home: Path
+):
+    """The Codex CLI rotates tokens in place. Losing that write would restore a
+    stale token later, so switching away must save what is live first."""
+    _write_live(temp_home, make_codex_auth(email="a@example.com", account_id="acc-a"))
+    store.add_current()
+    _write_live(temp_home, make_codex_auth(email="b@example.com", account_id="acc-b"))
+    store.add_current()
+
+    rotated = make_codex_auth(
+        email="b@example.com", account_id="acc-b", refresh_token="rotated-by-codex"
+    )
+    _write_live(temp_home, rotated)
+
+    store.switch("1")
+
+    saved = store.read_credential("2", "b@example.com")
+    assert json.loads(saved)["tokens"]["refresh_token"] == "rotated-by-codex"
+
+
+def test_switch_resolves_an_email_as_well_as_a_slot(
+    store: CodexAccountStore, temp_home: Path
+):
+    _write_live(temp_home, make_codex_auth(email="by@example.com", account_id="acc-by"))
+    store.add_current()
+    _write_live(temp_home, make_codex_auth(email="other@example.com", account_id="acc-o"))
+    store.add_current()
+
+    store.switch("by@example.com")
+    assert store.active_number() == "1"
+
+
+def test_switch_to_an_unknown_account_raises(store: CodexAccountStore):
+    with pytest.raises(ValueError, match="No Codex account"):
+        store.switch("7")
+
+
+def test_remove_drops_the_record_and_the_credential(
+    store: CodexAccountStore, temp_home: Path
+):
+    _write_live(temp_home, make_codex_auth(email="gone@example.com", account_id="acc-g"))
+    store.add_current()
+    path = store.credential_path("1", "gone@example.com")
+
+    store.remove("1")
+
+    assert store.accounts() == []
+    assert not path.exists()
+    assert store.active_number() is None
+
+
+def test_removing_a_non_active_account_leaves_the_active_pointer(
+    store: CodexAccountStore, temp_home: Path
+):
+    _write_live(temp_home, make_codex_auth(email="keep@example.com", account_id="acc-k"))
+    store.add_current()
+    _write_live(temp_home, make_codex_auth(email="drop@example.com", account_id="acc-d"))
+    store.add_current()
+    store.switch("1")
+
+    store.remove("2")
+
+    assert store.active_number() == "1"
