@@ -261,13 +261,17 @@ class CodexAccountStore:
             data = self._read_sequence()
             slot, record = self.resolve(identifier)
             email = str(record.get("email", ""))
+            # Recapture before the read. When the target is already live, the
+            # recapture stores the fresh live blob, and reading after it gives
+            # back those same bytes. Reading first would write the stale copy
+            # over a rotated single-use refresh token.
+            self._recapture_active(data)
             blob = self.read_credential(slot, email)
             if not blob:
                 raise ValueError(
                     f"No stored credential for slot {slot} ({email}). "
                     f"Re-add it with 'cswap codex add'."
                 )
-            self._recapture_active(data)
             self.write_live(blob)
             data["activeAccountNumber"] = int(slot)
             self._write_sequence(data)

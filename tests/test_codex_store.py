@@ -167,6 +167,52 @@ def test_switch_recaptures_the_live_credential_before_replacing_it(
     assert json.loads(saved)["tokens"]["refresh_token"] == "rotated-by-codex"
 
 
+def test_switch_to_the_already_live_slot_keeps_the_rotated_credential(
+    store: CodexAccountStore, temp_home: Path
+):
+    """Re-switching to the live account must not roll its token back.
+
+    OpenAI refresh tokens are single-use, so a rolled-back blob forces a
+    browser re-login the next time it is used.
+    """
+    _write_live(temp_home, make_codex_auth(email="a@example.com", account_id="acc-a"))
+    store.add_current()
+
+    rotated = make_codex_auth(
+        email="a@example.com", account_id="acc-a", refresh_token="a-v2-ROTATED"
+    )
+    _write_live(temp_home, rotated)
+
+    store.switch("1")
+
+    live = json.loads((temp_home / ".codex" / "auth.json").read_text())
+    assert live["tokens"]["refresh_token"] == "a-v2-ROTATED"
+    stored = json.loads(store.read_credential("1", "a@example.com"))
+    assert stored["tokens"]["refresh_token"] == "a-v2-ROTATED"
+
+
+def test_a_rotation_survives_switching_away_and_back(
+    store: CodexAccountStore, temp_home: Path
+):
+    _write_live(temp_home, make_codex_auth(email="a@example.com", account_id="acc-a"))
+    store.add_current()
+    _write_live(temp_home, make_codex_auth(email="b@example.com", account_id="acc-b"))
+    store.add_current()
+    store.switch("1")
+
+    rotated = make_codex_auth(
+        email="a@example.com", account_id="acc-a", refresh_token="a-v2-ROTATED"
+    )
+    _write_live(temp_home, rotated)
+
+    store.switch("1")
+    store.switch("2")
+    store.switch("1")
+
+    live = json.loads((temp_home / ".codex" / "auth.json").read_text())
+    assert live["tokens"]["refresh_token"] == "a-v2-ROTATED"
+
+
 def test_switch_resolves_an_email_as_well_as_a_slot(
     store: CodexAccountStore, temp_home: Path
 ):
