@@ -49,9 +49,10 @@ def _decode_jwt_payload(token: object) -> dict | None:
     segment = parts[1]
     segment += "=" * (-len(segment) % 4)
     try:
-        return json.loads(base64.urlsafe_b64decode(segment))
+        decoded = json.loads(base64.urlsafe_b64decode(segment))
     except (ValueError, TypeError, json.JSONDecodeError):
         return None
+    return decoded if isinstance(decoded, dict) else None
 
 
 def _tokens(blob: str) -> dict | None:

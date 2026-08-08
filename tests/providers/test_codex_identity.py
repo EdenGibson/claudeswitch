@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import time
 
@@ -53,6 +54,15 @@ def test_identity_of_garbage_is_none():
     assert codex.identity("not json") is None
     assert codex.identity(json.dumps({"tokens": {}})) is None
     assert codex.identity(json.dumps({"tokens": {"id_token": "a.b"}})) is None
+
+
+def test_identity_of_a_non_dict_jwt_payload_is_none():
+    """A JWT payload of ``[1, 2]`` decodes fine as JSON but isn't claims."""
+    raw = json.loads(make_codex_auth())
+    header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').decode().rstrip("=")
+    payload = base64.urlsafe_b64encode(b"[1,2]").decode().rstrip("=")
+    raw["tokens"]["id_token"] = f"{header}.{payload}.signature"
+    assert codex.identity(json.dumps(raw)) is None
 
 
 def test_fingerprint_tracks_the_refresh_token_only():

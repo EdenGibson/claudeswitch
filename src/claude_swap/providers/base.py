@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 from claude_swap.oauth import RefreshOutcome
 
@@ -36,7 +36,6 @@ class AccountIdentity:
         return f"{self.email} [{tag}]"
 
 
-@runtime_checkable
 class Provider(Protocol):
     """What a provider must supply. Implemented by ``CodexProvider``.
 
