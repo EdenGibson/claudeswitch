@@ -265,11 +265,12 @@ def try_refresh(blob: str, timeout_s: float = REFRESH_TIMEOUT_S) -> RefreshOutco
     if not isinstance(tokens, dict) or not tokens.get("refresh_token"):
         return RefreshOutcome(None, "no_refresh_token")
 
+    # Exactly the three fields upstream Codex sends, and no scope. The body is
+    # JSON here, unlike the authorization_code exchange.
     body = json.dumps({
         "grant_type": "refresh_token",
         "refresh_token": tokens["refresh_token"],
         "client_id": CLIENT_ID,
-        "scope": "openid profile email offline_access",
     }).encode("utf-8")
     req = urllib.request.Request(
         TOKEN_URL,

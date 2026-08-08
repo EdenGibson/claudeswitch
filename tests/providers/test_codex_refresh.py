@@ -55,6 +55,11 @@ def test_success_returns_a_whole_new_blob_with_the_rotated_tokens():
     assert captured["body"]["grant_type"] == "refresh_token"
     assert captured["body"]["refresh_token"] == "old-refresh"
     assert captured["body"]["client_id"] == codex.CLIENT_ID
+    # Exactly the three fields upstream Codex sends. A scope on a refresh
+    # grant is a narrowing request under RFC 6749 section 6, and the granted
+    # scope is wider than any we could name, so sending one risks a silently
+    # downgraded access token.
+    assert set(captured["body"]) == {"grant_type", "refresh_token", "client_id"}
 
     assert outcome.error is None
     refreshed = json.loads(outcome.credentials)
