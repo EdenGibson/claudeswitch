@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from claude_swap import paths
 from claude_swap.codex_store import CodexAccountStore
+from claude_swap.usage_store import UsageEntry
 from tests.providers.conftest import make_codex_auth
 
 
@@ -208,3 +210,96 @@ def test_removing_a_non_active_account_leaves_the_active_pointer(
     store.remove("2")
 
     assert store.active_number() == "1"
+
+
+def _seed_two_accounts(store: CodexAccountStore, temp_home: Path) -> None:
+    _write_live(temp_home, make_codex_auth(email="a@example.com", account_id="acc-a"))
+    store.add_current()
+    _write_live(temp_home, make_codex_auth(email="b@example.com", account_id="acc-b"))
+    store.add_current()
+
+
+def test_collect_usage_stores_a_row_per_account(
+    store: CodexAccountStore, temp_home: Path
+):
+    _seed_two_accounts(store, temp_home)
+    usage = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 40.0}}
+
+    with patch("claude_swap.providers.codex.fetch_usage", return_value=usage):
+        entries = store.collect_usage()
+
+    assert set(entries) == {"1", "2"}
+    assert entries["1"].last_good == usage
+    assert entries["2"].last_good == usage
+
+
+def test_collect_usage_records_a_failure_without_losing_the_last_good(
+    store: CodexAccountStore, temp_home: Path
+):
+    _seed_two_accounts(store, temp_home)
+    good = {"seven_day": {"pct": 40.0}}
+    with patch("claude_swap.providers.codex.fetch_usage", return_value=good):
+        store.collect_usage()
+
+    with patch(
+        "claude_swap.providers.codex.fetch_usage", side_effect=TimeoutError()
+    ):
+        entries = store.collect_usage(force=True)
+
+    assert entries["1"].last_good == good
+    assert entries["1"].last_error == "timeout"
+
+
+def test_collect_usage_refreshes_an_expired_token_first(
+    store: CodexAccountStore, temp_home: Path
+):
+    _write_live(
+        temp_home,
+        make_codex_auth(email="x@example.com", account_id="acc-x", access_expires_in=-5),
+    )
+    store.add_current()
+
+    fresh = make_codex_auth(email="x@example.com", account_id="acc-x")
+    from claude_swap.oauth import RefreshOutcome
+
+    with patch(
+        "claude_swap.providers.codex.try_refresh",
+        return_value=RefreshOutcome(fresh, None),
+    ) as refresh:
+        with patch(
+            "claude_swap.providers.codex.fetch_usage",
+            return_value={"seven_day": {"pct": 1.0}},
+        ):
+            store.collect_usage(force=True)
+
+    assert refresh.call_count == 1
+    assert store.read_credential("1", "x@example.com") == fresh
+
+
+def test_collect_usage_marks_a_dead_refresh_lineage(
+    store: CodexAccountStore, temp_home: Path
+):
+    _write_live(
+        temp_home,
+        make_codex_auth(email="d@example.com", account_id="acc-d", access_expires_in=-5),
+    )
+    store.add_current()
+    from claude_swap.oauth import RefreshOutcome
+
+    with patch(
+        "claude_swap.providers.codex.try_refresh",
+        return_value=RefreshOutcome(None, "invalid_grant"),
+    ):
+        entries = store.collect_usage(force=True)
+
+    assert entries["1"].sentinel == "token expired"
+
+
+def test_usage_entries_are_returned_for_accounts_never_fetched(
+    store: CodexAccountStore, temp_home: Path
+):
+    _seed_two_accounts(store, temp_home)
+    entries = store.usage_entries()
+    assert set(entries) == {"1", "2"}
+    assert all(isinstance(e, UsageEntry) for e in entries.values())
+    assert entries["1"].last_good is None

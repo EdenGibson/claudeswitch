@@ -18,15 +18,18 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import paths
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.locking import FileLock
+from claude_swap.oauth import _classify_usage_error as classify_usage_error
 from claude_swap.providers import codex
 from claude_swap.providers.base import AccountIdentity
 from claude_swap.settings import atomic_write_json
+from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore, with_sentinel
 
 PROVIDER = "codex"
 SCHEMA_VERSION = 1
@@ -286,3 +289,71 @@ class CodexAccountStore:
             self.delete_credential(slot, email)
             self._write_sequence(data)
         return slot, email
+
+    # -- usage --------------------------------------------------------------
+
+    def _identities(self) -> dict[str, tuple[str, str]]:
+        """Slot -> ``(email, accountId)``, the identity ``UsageStore`` guards on."""
+        return {
+            slot: (str(record.get("email", "")), str(record.get("accountId", "")))
+            for slot, record in self.accounts()
+        }
+
+    def _usage_store(self) -> UsageStore:
+        self.ensure_dirs()
+        return UsageStore(self.cache_dir)
+
+    def usage_entries(self) -> dict[str, UsageEntry]:
+        """Stored usage per slot, with no network call."""
+        return self._usage_store().entries(self._identities())
+
+    def collect_usage(self, force: bool = False) -> dict[str, UsageEntry]:
+        """Fetch usage for every account whose row is due, then return them all.
+
+        Refreshes an expired access token first and persists the rotated
+        credential, because a refresh that is not written back is lost work and
+        the next poll would repeat it. A dead refresh lineage is surfaced as the
+        ``token expired`` sentinel rather than a fetch error, so the UI can say
+        what the user must actually do.
+        """
+        usage_store = self._usage_store()
+        identities = self._identities()
+        entries = usage_store.entries(identities)
+        now = time.time()
+
+        outcomes: dict[str, FetchRecord] = {}
+        sentinels: dict[str, str] = {}
+
+        for slot, (email, _account_id) in identities.items():
+            entry = entries.get(slot)
+            if not force and entry is not None and entry.fresh(now):
+                continue
+
+            blob = self.read_credential(slot, email)
+            if not blob:
+                continue
+
+            if codex.is_expired(blob):
+                refreshed = codex.try_refresh(blob)
+                if refreshed.error is not None:
+                    if refreshed.error in ("invalid_grant", "no_refresh_token"):
+                        sentinels[slot] = "token expired"
+                    continue
+                blob = refreshed.credentials
+                self.write_credential(slot, email, blob)
+
+            try:
+                usage = codex.fetch_usage(blob)
+            except Exception as exc:  # noqa: BLE001 - classified just below
+                kind, retry_after = classify_usage_error(exc)
+                outcomes[slot] = FetchRecord(error=kind, retry_after_s=retry_after)
+                continue
+            outcomes[slot] = FetchRecord(usage=usage)
+
+        if outcomes:
+            usage_store.record(outcomes, identities)
+
+        merged = usage_store.entries(identities)
+        for slot, sentinel in sentinels.items():
+            merged[slot] = with_sentinel(merged.get(slot, UsageEntry()), sentinel)
+        return merged
