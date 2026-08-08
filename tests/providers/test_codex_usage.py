@@ -60,6 +60,36 @@ def test_an_unrecognised_window_length_becomes_a_scoped_entry():
     assert result["scoped"][0]["pct"] == 12.5
 
 
+def test_a_float_window_length_still_classifies():
+    """JSON gives no integer guarantee. A dropped window reads as "unknown"
+    headroom for an account that is in fact maxed out."""
+    data = _response()
+    data["rate_limit"]["primary_window"]["limit_window_seconds"] = 604800.0
+    result = codex.build_usage_result(data)
+    assert result is not None
+    assert result["seven_day"]["pct"] == 74.0
+    assert "scoped" not in result
+
+
+def test_a_bool_window_length_is_rejected():
+    """isinstance(True, int) is True, which would name the window "0h"."""
+    data = _response()
+    data["rate_limit"]["secondary_window"]["limit_window_seconds"] = True
+    result = codex.build_usage_result(data)
+    assert "five_hour" not in result
+    assert "scoped" not in result
+
+
+@pytest.mark.parametrize("literal", ["NaN", "Infinity"])
+def test_a_non_finite_window_length_is_rejected(literal: str):
+    """json.loads accepts both literals, and int() raises on either."""
+    data = _response()
+    data["rate_limit"]["secondary_window"]["limit_window_seconds"] = float(literal)
+    result = codex.build_usage_result(data)
+    assert "five_hour" not in result
+    assert "scoped" not in result
+
+
 def test_no_windows_at_all_returns_none():
     assert codex.build_usage_result({"rate_limit": {}}) is None
     assert codex.build_usage_result({}) is None

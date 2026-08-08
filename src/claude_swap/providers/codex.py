@@ -19,6 +19,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import time
 import urllib.error
 import urllib.request
@@ -168,8 +169,16 @@ def _window_entry(window: object) -> tuple[str, dict] | None:
     if not isinstance(pct, (int, float)):
         return None
     length = window.get("limit_window_seconds")
-    if not isinstance(length, int):
+    # JSON promises no integer, so accept a float and cast, exactly as pct is
+    # handled above. bool is rejected because isinstance(True, int) is True,
+    # and a bool length would name the window "0h". NaN and infinity are
+    # rejected because json.loads accepts both literals and int() raises on
+    # either.
+    if isinstance(length, bool) or not isinstance(length, (int, float)):
         return None
+    if isinstance(length, float) and not math.isfinite(length):
+        return None
+    length = int(length)
 
     entry: dict = {"pct": float(pct)}
     reset_at = window.get("reset_at")
