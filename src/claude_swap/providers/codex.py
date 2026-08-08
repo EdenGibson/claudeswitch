@@ -20,10 +20,11 @@ import hashlib
 import json
 import logging
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-from claude_swap.oauth import format_reset
+from claude_swap.oauth import RefreshOutcome, format_reset
 from claude_swap.providers.base import AccountIdentity
 
 _logger = logging.getLogger("claude-swap")
@@ -241,3 +242,81 @@ def fetch_usage(blob: str) -> dict | None:
     if not isinstance(access_token, str) or not access_token:
         return None
     return build_usage_result(request_usage_data(access_token, str(account_id)))
+
+
+REFRESH_TIMEOUT_S = 10.0
+
+
+def try_refresh(blob: str, timeout_s: float = REFRESH_TIMEOUT_S) -> RefreshOutcome:
+    """Exchange the refresh token for a fresh credential blob.
+
+    Returns a whole new auth.json body and never mutates the input. The grant
+    rotates the refresh token, so a partial write here costs a browser
+    re-login; the caller persists only on ``error is None``.
+    """
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return RefreshOutcome(None, "no_refresh_token")
+    if not isinstance(data, dict):
+        return RefreshOutcome(None, "no_refresh_token")
+    tokens = data.get("tokens")
+    if not isinstance(tokens, dict) or not tokens.get("refresh_token"):
+        return RefreshOutcome(None, "no_refresh_token")
+
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": tokens["refresh_token"],
+        "client_id": CLIENT_ID,
+        "scope": "openid profile email offline_access",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": "claude-swap/1.0"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            payload = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        # 400/401 mean this refresh lineage is dead: re-login required, do not
+        # retry. Anything else may recover.
+        error = "invalid_grant" if exc.code in (400, 401) else "transient"
+        _logger.warning("Codex refresh failed: http-%s", exc.code)
+        return RefreshOutcome(None, error)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        _logger.warning("Codex refresh failed: %s", type(exc).__name__)
+        return RefreshOutcome(None, "transient")
+
+    access_token = payload.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        _logger.warning("Codex refresh returned no access_token")
+        return RefreshOutcome(None, "transient")
+
+    new_tokens = dict(tokens)
+    new_tokens["access_token"] = access_token
+    if isinstance(payload.get("id_token"), str) and payload["id_token"]:
+        new_tokens["id_token"] = payload["id_token"]
+    if isinstance(payload.get("refresh_token"), str) and payload["refresh_token"]:
+        new_tokens["refresh_token"] = payload["refresh_token"]
+
+    refreshed = dict(data)
+    refreshed["tokens"] = new_tokens
+    refreshed["last_refresh"] = (
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    )
+    new_blob = json.dumps(refreshed, indent=2)
+
+    ident = identity(new_blob)
+    token_account = (
+        {
+            "uuid": ident.account_uuid,
+            "email": ident.email,
+            "organizationUuid": ident.org_uuid,
+        }
+        if ident
+        else None
+    )
+    return RefreshOutcome(new_blob, None, token_account)
