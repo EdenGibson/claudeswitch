@@ -65,17 +65,44 @@ class CodexAccountStore:
         return FileLock(self._lock_path)
 
     def _read_sequence(self) -> dict:
-        """The sequence file, or an empty shape when absent or unreadable."""
+        """The sequence file, or an empty shape when absent or unreadable.
+
+        Takes no lock. Every caller that then writes must hold ``self._lock()``
+        across its own read-modify-write, or it loses a concurrent update.
+
+        Every surviving account is a dict under a decimal-digit key, which is
+        what ``accounts``, ``next_slot`` and ``resolve`` all assume. A record
+        that is not is dropped with a warning, because a partial read beats an
+        AttributeError or a ValueError out of ``int()``.
+        """
         try:
             data = json.loads(self.sequence_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return {"schemaVersion": SCHEMA_VERSION, "accounts": {}}
         if not isinstance(data, dict) or not isinstance(data.get("accounts"), dict):
             return {"schemaVersion": SCHEMA_VERSION, "accounts": {}}
+        kept = {}
+        for slot, record in data["accounts"].items():
+            if not isinstance(slot, str) or not slot.isdecimal():
+                _logger.warning("Dropping Codex account under non-numeric slot %r", slot)
+                continue
+            if not isinstance(record, dict):
+                _logger.warning(
+                    "Dropping Codex account in slot %s: record is a %s, not an object",
+                    slot,
+                    type(record).__name__,
+                )
+                continue
+            kept[slot] = record
+        data["accounts"] = kept
         return data
 
     def _write_sequence(self, data: dict) -> None:
-        """Stamp and atomically write the sequence file."""
+        """Stamp and atomically write the sequence file.
+
+        Takes no lock. The caller must hold ``self._lock()`` across the whole
+        read-modify-write, or a concurrent update is lost silently.
+        """
         self.ensure_dirs()
         data["schemaVersion"] = SCHEMA_VERSION
         data["lastUpdated"] = _timestamp()
@@ -136,7 +163,9 @@ class CodexAccountStore:
         except OSError:
             return ""
         try:
-            return base64.b64decode(encoded).decode("utf-8")
+            # validate=True rejects junk instead of discarding it silently,
+            # which would hand back a partial blob. Matches credentials.py.
+            return base64.b64decode(encoded, validate=True).decode("utf-8")
         except (ValueError, UnicodeDecodeError):
             _logger.warning("Codex credential for slot %s is unreadable", slot)
             return ""
@@ -197,8 +226,11 @@ class CodexAccountStore:
 
     # -- mutations ----------------------------------------------------------
 
-    def _recapture_active(self, data: dict) -> None:
+    def _recapture_live(self, data: dict) -> None:
         """Save the live credential back into the slot that owns it.
+
+        Matches on ``accountId`` and ignores ``activeAccountNumber``, so it
+        works on the live file whatever the recorded active slot says.
 
         The Codex CLI refreshes tokens in place. Without this, switching away
         discards that rotation and a later switch back restores a stale token.
@@ -265,7 +297,7 @@ class CodexAccountStore:
             # recapture stores the fresh live blob, and reading after it gives
             # back those same bytes. Reading first would write the stale copy
             # over a rotated single-use refresh token.
-            self._recapture_active(data)
+            self._recapture_live(data)
             blob = self.read_credential(slot, email)
             if not blob:
                 raise ValueError(

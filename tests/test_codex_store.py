@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -76,6 +77,37 @@ def test_a_stored_credential_is_owner_only(store: CodexAccountStore):
 
 def test_reading_a_missing_credential_returns_empty(store: CodexAccountStore):
     assert store.read_credential("9", "nobody@example.com") == ""
+
+
+def test_a_credential_with_interleaved_junk_reads_as_empty(store: CodexAccountStore):
+    """Junk must be rejected, not silently discarded into a partial blob."""
+    store.ensure_dirs()
+    path = store.credential_path("1", "junk@example.com")
+    encoded = base64.b64encode(make_codex_auth().encode("utf-8")).decode("ascii")
+    path.write_bytes((encoded[:20] + "!!!!" + encoded[20:]).encode("ascii"))
+    assert store.read_credential("1", "junk@example.com") == ""
+
+
+def test_a_non_dict_account_record_is_dropped(store: CodexAccountStore):
+    """accounts() promises list[tuple[str, dict]]. A string record made the
+    first record.get() raise AttributeError."""
+    store.ensure_dirs()
+    store.sequence_file.write_text(
+        json.dumps({"accounts": {"1": "hello", "abc": {"email": "x@example.com"}}}),
+        encoding="utf-8",
+    )
+    assert store.accounts() == []
+    assert store.next_slot() == "1"
+
+
+def test_a_valid_record_survives_alongside_a_dropped_one(store: CodexAccountStore):
+    store.ensure_dirs()
+    store.sequence_file.write_text(
+        json.dumps({"accounts": {"1": "hello", "2": {"email": "keep@example.com"}}}),
+        encoding="utf-8",
+    )
+    assert store.accounts() == [("2", {"email": "keep@example.com"})]
+    assert store.next_slot() == "1"
 
 
 def test_deleting_a_credential_is_idempotent(store: CodexAccountStore):
