@@ -685,6 +685,15 @@ class ClaudeAccountSwitcher:
         if not record:
             return False
         email = record.get("email", "")
+        provider = record.get("provider") or "claude"
+        if provider != "claude":
+            # A non-Claude slot has no Claude config backup and never needs
+            # one. A stored credential is the whole requirement.
+            return bool(
+                self._read_provider_credentials(
+                    provider, str(account_num), email, is_active=False
+                )
+            )
         if not self._read_account_credentials(str(account_num), email):
             return False
         if not self._read_account_config(str(account_num), email):
@@ -1482,7 +1491,10 @@ class ClaudeAccountSwitcher:
         accounts: list[AccountSnapshot] = []
         for num, email, org_name, org_uuid, is_active, _creds, alias in accounts_info:
             n = str(num)
-            if is_active:
+            provider = self.provider_of(n)
+            # ``active_number`` drives the Claude switch UI, so only a Claude
+            # slot may claim it. A Codex row is still marked active in itself.
+            if is_active and provider == "claude":
                 active_number = n
             accounts.append(
                 AccountSnapshot(
@@ -1496,6 +1508,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    provider=provider,
                 )
             )
         return AccountsSnapshot(
@@ -1560,12 +1573,20 @@ class ClaudeAccountSwitcher:
         disabled (``cswap disable``). Disabled slots stay managed and remain
         valid explicit ``cswap switch <num|email>`` targets — they are only
         held out of automatic rotation and the usage-aware strategies.
+
+        Non-Claude slots are excluded too. Rotation exists to move Claude Code
+        onto a different account, and Claude Code cannot read another
+        provider's credential, so landing on one would leave it unauthenticated
+        rather than switched. Cross-provider rotation needs the router; until
+        then a Codex account is an explicit target only.
         """
         data = self._get_sequence_data() or {}
         return [
             str(num)
             for num in data.get("sequence", [])
-            if self._account_is_switchable(str(num))
+            if (data.get("accounts", {}).get(str(num), {}).get("provider") or "claude")
+            == "claude"
+            and self._account_is_switchable(str(num))
             and not self._disabled_from_data(data, str(num))
         ]
 
@@ -4797,6 +4818,83 @@ class ClaudeAccountSwitcher:
             if json_output else None
         )
 
+    def _switch_to_provider_account(
+        self, provider: str, account_num: str, *, json_output: bool = False
+    ) -> dict | None:
+        """Make a non-Claude slot live. Leaves every other provider alone.
+
+        Switching Codex writes ``~/.codex/auth.json`` only. Claude Code keeps
+        reading its own credential, so the Claude active account is unchanged.
+        """
+        if provider != "codex":
+            raise ConfigError(f"Cannot switch a {provider} account")
+
+        from claude_swap.codex_store import CodexAccountStore
+
+        data = self._get_sequence_data() or {}
+        account = data.get("accounts", {}).get(str(account_num), {})
+        email = account.get("email", "")
+        store = CodexAccountStore()
+
+        # Recapture before reading the stored copy. When the target is already
+        # live, the recapture stores the fresh blob and the read gives back
+        # those same bytes. Reading first would write a stale copy over a
+        # rotated single-use refresh token, spending the user's login.
+        self._recapture_provider_live(provider, data)
+        blob = store.read_credential(str(account_num), email)
+        if not blob:
+            raise ConfigError(
+                f"No stored credential for Account-{account_num} ({email}). "
+                f"Re-add it with 'cswap add --provider {provider}'."
+            )
+        store.write_live(blob)
+        self._record_provider_active(provider, str(account_num))
+
+        if json_output:
+            return {
+                "schemaVersion": SCHEMA_VERSION,
+                "switched": True,
+                "provider": provider,
+                "to": account_ref(int(account_num), email),
+                "strategy": "direct",
+                "warnings": [],
+            }
+        print(f"{accent('Switched to')} Account-{account_num} ({email}) [{provider}]")
+        return None
+
+    def _recapture_provider_live(self, provider: str, data: dict) -> None:
+        """Save a non-Claude live credential back into the slot that owns it.
+
+        The Codex CLI refreshes its token in place and nothing syncs that back.
+        Without this, switching away discards the rotation and a later switch
+        back restores a token the server has already retired.
+        """
+        if provider != "codex":
+            return
+        from claude_swap.codex_store import CodexAccountStore
+        from claude_swap.providers import codex
+
+        store = CodexAccountStore()
+        live = store.read_live()
+        if not live:
+            return
+        identity = codex.identity(live)
+        if identity is None:
+            return
+        for num, account in data.get("accounts", {}).items():
+            if account.get("provider") != provider:
+                continue
+            if account.get("uuid") == identity.account_uuid:
+                store.write_credential(str(num), account.get("email", ""), live)
+                return
+
+    def _record_provider_active(self, provider: str, account_num: str) -> None:
+        """Point ``activeProviderAccounts`` at a slot, under the registry lock."""
+        with FileLock(self.lock_file):
+            data = self._get_sequence_data() or {}
+            data.setdefault("activeProviderAccounts", {})[provider] = str(account_num)
+            self._write_json(self.sequence_file, data)
+
     def switch_to(
         self, identifier: str, json_output: bool = False, force: bool = False
     ) -> dict | None:
@@ -4854,6 +4952,15 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data()
         if target_account not in data.get("accounts", {}):
             raise AccountNotFoundError(f"Account-{target_account} does not exist")
+
+        provider = self.provider_of(target_account)
+        if provider != "claude":
+            # None of the Claude ceremony below applies: no keychain, no
+            # session profile, no config backup, no rollback record. A Codex
+            # switch is one guarded file write.
+            return self._switch_to_provider_account(
+                provider, target_account, json_output=json_output
+            )
 
         # Short-circuit a no-op before mutating (issue #79). A self-switch
         # would first back up the live credentials into the target slot —

@@ -178,6 +178,10 @@ def account_card_text(
     else:
         text.append(acc.email, style=palette.foreground)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if acc.provider != "claude":
+        # Only a non-Claude row is tagged, so a Claude-only pool looks
+        # exactly as it did before.
+        text.append(f"  ({acc.provider})", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
@@ -253,6 +257,10 @@ def mini_account_text(
     else:
         text.append(acc.email, style=palette.foreground)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if acc.provider != "claude":
+        # Only a non-Claude row is tagged, so a Claude-only pool looks
+        # exactly as it did before.
+        text.append(f"  ({acc.provider})", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
     text.append("   ")
