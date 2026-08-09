@@ -2696,6 +2696,96 @@ class ClaudeAccountSwitcher:
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
 
+    def _delete_provider_files(
+        self, provider: str, account_num: str, email: str
+    ) -> None:
+        """Delete a non-Claude slot's stored credential.
+
+        The provider's live credential file is deliberately left alone: this
+        removes cswap's copy, never the user's current login.
+        """
+        if provider != "codex":
+            return
+        from claude_swap.codex_store import CodexAccountStore
+
+        CodexAccountStore().delete_credential(account_num, email)
+
+    def add_provider_account(
+        self, provider: str, slot: int | None = None
+    ) -> tuple[str, str]:
+        """Capture a provider's live credential into a slot. Returns (slot, label).
+
+        Duplicate detection keys on the provider's own account id, not the
+        email: one person can hold two ChatGPT accounts on the same address.
+        """
+        ops = provider_ops.ops_for(provider)
+        live = ops.read_live()
+        if not live:
+            raise ConfigError(
+                f"No {provider} credential at {ops.live_path()}. "
+                f"Run '{ops.binary} login' first."
+            )
+        identity = ops.identity(live)
+        if identity is None:
+            raise ConfigError(
+                f"Could not read a {provider} account from {ops.live_path()}"
+            )
+
+        with FileLock(self.lock_file):
+            data = self._get_sequence_data() or {
+                "sequence": [], "accounts": {}, "activeAccountNumber": None
+            }
+            data.setdefault("accounts", {})
+            data.setdefault("sequence", [])
+            for num, account in data["accounts"].items():
+                if (
+                    account.get("provider") == provider
+                    and account.get("uuid") == identity.account_uuid
+                ):
+                    raise ConfigError(
+                        f"{identity.email} is already managed in Account-{num}"
+                    )
+
+            if slot is not None:
+                target = str(slot)
+                if target in data["accounts"]:
+                    raise ConfigError(f"Account-{target} is already taken")
+            else:
+                taken = {int(n) for n in data["accounts"] if str(n).isdecimal()}
+                candidate = 1
+                while candidate in taken:
+                    candidate += 1
+                target = str(candidate)
+
+            data["accounts"][target] = {
+                "email": identity.email,
+                "uuid": identity.account_uuid,
+                "organizationUuid": identity.org_uuid,
+                "organizationName": identity.org_name,
+                "added": get_timestamp(),
+                "provider": provider,
+                "plan": identity.plan,
+            }
+            if int(target) not in data["sequence"]:
+                data["sequence"].append(int(target))
+                data["sequence"].sort()
+            data.setdefault("activeProviderAccounts", {})[provider] = target
+            data["lastUpdated"] = get_timestamp()
+            self._write_provider_credential(provider, target, identity.email, live)
+            self._write_json(self.sequence_file, data)
+
+        return target, identity.display_label
+
+    def _write_provider_credential(
+        self, provider: str, account_num: str, email: str, blob: str
+    ) -> None:
+        """Store a non-Claude slot's credential in its own backend."""
+        if provider != "codex":
+            raise ConfigError(f"Cannot store a {provider} credential")
+        from claude_swap.codex_store import CodexAccountStore
+
+        CodexAccountStore().write_credential(account_num, email, blob)
+
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
 
@@ -2770,7 +2860,14 @@ class ClaudeAccountSwitcher:
                 return
 
         # Remove backup files
-        self._delete_account_files(account_num, email)
+        provider = account_info.get("provider") or "claude"
+        if provider == "claude":
+            self._delete_account_files(account_num, email)
+        else:
+            self._delete_provider_files(provider, account_num, email)
+            active_map = data.get("activeProviderAccounts") or {}
+            if str(active_map.get(provider)) == account_num:
+                active_map.pop(provider, None)
 
         # Update sequence.json
         del data["accounts"][account_num]

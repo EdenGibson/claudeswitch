@@ -1039,6 +1039,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help="Set a short display alias for the account (use with 'add')",
     )
     parser.add_argument(
+        "--provider",
+        metavar="NAME",
+        help=(
+            "Which provider's live login to capture (use with 'add'). "
+            "Defaults to claude; 'codex' captures the ChatGPT login"
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help=(
@@ -1204,6 +1212,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.alias is not None and not args.add_account:
         parser.error("--alias can only be used with 'add'")
 
+    if args.provider is not None:
+        from claude_swap import provider_ops
+
+        if not args.add_account:
+            parser.error("--provider can only be used with 'add'")
+        if not provider_ops.is_known(args.provider):
+            names = ", ".join(provider_ops.provider_names())
+            parser.error(f"unknown provider: {args.provider} (choose from {names})")
+
     if args.force and not (args.import_ or args.switch_to):
         parser.error("--force can only be used with 'import' or 'switch <num|email>'")
 
@@ -1238,7 +1255,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
 
         if args.add_account:
-            switcher.add_account(slot=args.slot, alias=args.alias)
+            provider = args.provider or "claude"
+            if provider == "claude":
+                switcher.add_account(slot=args.slot, alias=args.alias)
+            else:
+                num, label = switcher.add_provider_account(provider, slot=args.slot)
+                print(f"Added {label} as Account-{num} ({provider})")
         elif args.add_token is not None:
             switcher.add_account_from_token(
                 token=args.add_token,
