@@ -865,6 +865,13 @@ def main() -> None:
     except Exception:
         pass  # theme is cosmetic; never block the CLI on it
 
+    # Fold any standalone Codex pool into the main registry. Runs here, before
+    # dispatch, because it takes the registry lock and FileLock is not
+    # reentrant — inside a command it could deadlock.
+    from claude_swap.pool_migration import ensure_migrated
+
+    ensure_migrated()
+
     # `run` and `auto` keep their dedicated pre-dispatch parsers.
     if argv and argv[0] == "run":
         _run_command(argv[1:])
