@@ -4040,6 +4040,7 @@ class ClaudeAccountSwitcher:
                     last_good_usage=entry.last_good,
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
+                    provider=self.provider_of(num),
                 )
             )
         payload = {
@@ -4047,6 +4048,15 @@ class ClaudeAccountSwitcher:
             "activeAccountNumber": active_num,
             "accounts": accounts,
         }
+        # Each provider has its own live credential file, so each has its own
+        # active account. Additive and omitted when only Claude is in the pool.
+        other_active = {
+            name: slot
+            for name, slot in self.active_by_provider().items()
+            if name != "claude" and slot is not None
+        }
+        if other_active:
+            payload["activeProviderAccounts"] = other_active
         # Additive fields (absent when clean) — never printed warnings; the
         # JSON contract keeps stdout a single machine-readable object.
         dup_warnings = self._duplicate_account_warnings(accounts_info)
@@ -4100,6 +4110,11 @@ class ClaudeAccountSwitcher:
             tag = self._get_display_tag(email, org_name, org_uuid)
             label = f"{accent(alias)} ({email})" if alias else email
             markers = ""
+            provider = self.provider_of(num)
+            if provider != "claude":
+                # Only a non-Claude row is tagged, so a Claude-only pool prints
+                # exactly what upstream prints.
+                markers += f" {muted(f'({provider})')}"
             if is_active:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
@@ -4225,11 +4240,19 @@ class ClaudeAccountSwitcher:
                     entry.last_good, entry.fetched_at, entry.age_s
                 )
             )
-        return {
+        payload = {
             "schemaVersion": SCHEMA_VERSION,
             "active": active,
             "totalManagedAccounts": len(data.get("accounts", {})),
         }
+        other = {
+            name: int(slot)
+            for name, slot in self.active_by_provider().items()
+            if name != "claude" and slot is not None
+        }
+        if other:
+            payload["activeProviderAccounts"] = other
+        return payload
 
     def status(self, json_output: bool = False) -> dict | None:
         """Display current account status (or return the schema-v1 payload)."""
@@ -4267,7 +4290,43 @@ class ClaudeAccountSwitcher:
                 print(f"  {line}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+        self._print_other_provider_status(data)
         return None
+
+    def _print_other_provider_status(self, data: dict) -> None:
+        """One line per non-Claude provider that has an active account.
+
+        Nothing prints when the pool holds only Claude accounts, so the
+        upstream output is unchanged for anyone who never adds one.
+        """
+        for name, slot in self.active_by_provider().items():
+            if name == "claude" or slot is None:
+                continue
+            account = data.get("accounts", {}).get(str(slot), {})
+            email = account.get("email", "")
+            org_name = account.get("organizationName", "") or ""
+            org_uuid = account.get("organizationUuid", "") or ""
+            tag = self._get_display_tag(email, org_name, org_uuid)
+            print(
+                f"{bolded(f'{name.capitalize()}:')} {accent(f'Account-{slot}')} "
+                f"({email} {muted(f'[{tag}]')})"
+            )
+            for line in _usage_entry_lines(self._provider_active_usage(name, str(slot))):
+                print(f"  {line}")
+
+    def _provider_active_usage(self, provider: str, slot: str) -> UsageEntry:
+        """Stored usage for a non-Claude slot. Never fetches."""
+        data = self._get_sequence_data() or {}
+        account = data.get("accounts", {}).get(str(slot), {})
+        # Same identity key the collect pass uses, or the stored row does not
+        # match and the account reads as having no measurement at all.
+        identities = {
+            str(slot): (
+                account.get("email", ""),
+                account.get("organizationUuid", "") or "",
+            )
+        }
+        return self._usage_store.entries(identities).get(str(slot), UsageEntry())
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""
