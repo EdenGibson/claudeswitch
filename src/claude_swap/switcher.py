@@ -80,7 +80,7 @@ from claude_swap.paths import (
     migrate_legacy_backup_dir,
 )
 from claude_swap.process_detection import get_running_instances
-from claude_swap import poll_policy
+from claude_swap import poll_policy, provider_ops
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
     FetchRecord,
@@ -1654,6 +1654,48 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data() or {}
         return data.get("accounts", {}).get(str(account_num), {}).get("email", "")
 
+    def provider_of(self, account_num: str | int) -> str:
+        """Which credential backend owns a slot. Unknown slots read as Claude."""
+        cached = getattr(self, "_slot_providers", None)
+        if cached is not None and str(account_num) in cached:
+            return cached[str(account_num)]
+        data = self._get_sequence_data() or {}
+        account = data.get("accounts", {}).get(str(account_num), {})
+        return account.get("provider") or "claude"
+
+    def provider_active_number(self, provider: str) -> str | None:
+        """Slot of ``provider``'s live login, or None when it is unmanaged.
+
+        Claude and Codex read different credential files, so each provider has
+        its own active account. The registry records the Codex one under
+        ``activeProviderAccounts``, but that pointer only nominates a slot —
+        the live blob's own identity decides, because ``codex login`` run
+        outside cswap changes the file without touching the registry.
+        """
+        if provider == "claude":
+            return self.current_account_number()
+        ops = provider_ops.ops_for(provider)
+        live = ops.read_live()
+        if not live:
+            return None
+        identity = ops.identity(live)
+        if identity is None:
+            return None
+        data = self._get_sequence_data() or {}
+        for num, account in data.get("accounts", {}).items():
+            if account.get("provider") != provider:
+                continue
+            if account.get("uuid") == identity.account_uuid:
+                return str(num)
+        return None
+
+    def active_by_provider(self) -> dict[str, str | None]:
+        """The active slot of every provider the pool can hold."""
+        return {
+            name: self.provider_active_number(name)
+            for name in provider_ops.provider_names()
+        }
+
     def current_account_number(self) -> str | None:
         """Slot of the live login; ``None`` when there is none or it's unmanaged.
 
@@ -2725,8 +2767,15 @@ class ClaudeAccountSwitcher:
 
         Shared by list_accounts and the usage-aware switch helpers so the active
         slot is detected and credentials are read in exactly one place. The
-        active account's credentials come from Claude Code's live store; every
+        active account's credentials come from its provider's live store; every
         other slot reads its backup copy.
+
+        The tuple shape is upstream's. Each slot's provider is recorded in
+        ``self._slot_providers`` instead of a widened tuple, so no consumer or
+        test that unpacks seven elements has to change.
+
+        Each provider has its own active slot, because Claude Code and the
+        Codex CLI read different credential files.
         """
         data = self._get_sequence_data_migrated() or {}
         current_identity = self._get_current_account()
@@ -2736,8 +2785,13 @@ class ClaudeAccountSwitcher:
         if current_identity is not None:
             current_email, current_org_uuid = current_identity
             active_num = self._find_account_slot(data, current_email, current_org_uuid)
+        active_for: dict[str, str | None] = {"claude": active_num}
 
         accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
+        self._slot_providers = {
+            str(n): (a.get("provider") or "claude")
+            for n, a in data.get("accounts", {}).items()
+        }
         # Reset each build; set below only when the active slot's OAuth Keychain
         # read failed with no fallback. Read by _static_usage_sentinel (main
         # thread writes it here before the fetch pool starts → no data race).
@@ -2748,9 +2802,18 @@ class ClaudeAccountSwitcher:
             org_name = account.get("organizationName", "") or ""
             org_uuid = account.get("organizationUuid", "") or ""
             alias = account.get("alias", "") or ""
-            is_active = str(num) == active_num
+            provider = account.get("provider") or "claude"
+            if provider not in active_for:
+                # Resolved once per provider, not once per slot: the Codex
+                # lookup reads and decodes the live credential.
+                active_for[provider] = self.provider_active_number(provider)
+            is_active = str(num) == active_for.get(provider)
 
-            if is_active:
+            if provider != "claude":
+                creds = self._read_provider_credentials(
+                    provider, str(num), email, is_active=is_active
+                )
+            elif is_active:
                 active = self._read_active_credentials()
                 creds = active.value or ""
                 self._active_keychain_unavailable = active.keychain_unavailable
@@ -2759,6 +2822,26 @@ class ClaudeAccountSwitcher:
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
+
+    def _read_provider_credentials(
+        self, provider: str, account_num: str, email: str, *, is_active: bool
+    ) -> str:
+        """A non-Claude slot's credential: the live file when it owns it.
+
+        Reading the live file for the active slot matters for Codex, whose CLI
+        rotates the token in place. The stored copy goes stale the moment the
+        Codex CLI refreshes, and OpenAI refresh tokens are single use, so a
+        stale copy is not merely old — it is spent.
+        """
+        if is_active:
+            live = provider_ops.ops_for(provider).read_live()
+            if live:
+                return live
+        if provider == "codex":
+            from claude_swap.codex_store import CodexAccountStore
+
+            return CodexAccountStore().read_credential(account_num, email)
+        return ""
 
     def _fetch_active_usage(
         self, account_num: str, email: str, creds: str, org_uuid: str = ""
@@ -3882,7 +3965,7 @@ class ClaudeAccountSwitcher:
         accounts = []
         seq_data = self._get_sequence_data() or {}
         for num, email, org_name, org_uuid, is_active, _, alias in accounts_info:
-            if is_active:
+            if is_active and self.provider_of(num) == "claude":
                 active_num = num
             entry = entries[str(num)]
             # JSON carries the decision-grade value: last-good only while it is
