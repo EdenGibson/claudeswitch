@@ -891,6 +891,10 @@ class ClaudeAccountSwitcher:
         creds_b = self._read_account_credentials(num_b, email_b)
         config_a = self._read_account_config(num_a, email_a)
         config_b = self._read_account_config(num_b, email_b)
+        # A non-Claude slot keeps one credential file under the same key, so
+        # it has to follow the account to its new number.
+        prov_a = self._read_provider_material(num_a, email_a)
+        prov_b = self._read_provider_material(num_b, email_b)
 
         staging: dict[str, Path] = {}
         try:
@@ -932,6 +936,8 @@ class ClaudeAccountSwitcher:
                 self._write_account_config(num_a, email_b, config_b)
             else:
                 self._delete_config_backup(num_a, email_b)
+            self._put_provider_material(num_b, email_a, prov_a)
+            self._put_provider_material(num_a, email_b, prov_b)
 
             data["accounts"][num_a], data["accounts"][num_b] = record_b, record_a
             int_a, int_b = int(num_a), int(num_b)
@@ -948,6 +954,7 @@ class ClaudeAccountSwitcher:
                 data["activeAccountNumber"] = int_b
             elif active == int_b:
                 data["activeAccountNumber"] = int_a
+            self._renumber_provider_active(data, {num_a: num_b, num_b: num_a})
             data["lastUpdated"] = get_timestamp()
             # The commit point: _write_json's rename publishes the swap.
             self._write_json(self.sequence_file, data)
@@ -957,6 +964,11 @@ class ClaudeAccountSwitcher:
                 num_b, email_b, creds_b, config_b,
                 staging,
             )
+            try:
+                self._put_provider_material(num_a, email_a, prov_a)
+                self._put_provider_material(num_b, email_b, prov_b)
+            except OSError as e:
+                self._logger.error(f"Provider credential restore failed: {e}")
             raise
 
         # Post-commit cleanup, all best-effort: the records already reference
@@ -966,6 +978,7 @@ class ClaudeAccountSwitcher:
         if email_a != email_b:
             for num, email in ((num_a, email_a), (num_b, email_b)):
                 try:
+                    self._put_provider_material(num, email, "")
                     self._delete_account_files(num, email)
                 except Exception as e:
                     self._logger.error(
@@ -985,6 +998,46 @@ class ClaudeAccountSwitcher:
             f"Swapped slots: {num_a} ({email_a}) <-> {num_b} ({email_b})"
         )
         return num_a, num_b
+
+    def _read_provider_material(self, account_num: str, email: str) -> str:
+        """Stored non-Claude credential for one slot key, or "" when there is none.
+
+        Codex is the only non-Claude backend, and a Claude slot never has one
+        of its files, so this needs no provider argument: the key either holds
+        a provider credential or it does not.
+        """
+        from claude_swap.codex_store import CodexAccountStore
+
+        return CodexAccountStore().read_credential(account_num, email)
+
+    def _put_provider_material(
+        self, account_num: str, email: str, blob: str
+    ) -> None:
+        """Set one slot key's non-Claude credential to exactly ``blob``.
+
+        An empty blob clears the key. Clearing matters on a same-email swap,
+        where the destination key is also a source key and would otherwise
+        keep serving the other account's credential.
+        """
+        from claude_swap.codex_store import CodexAccountStore
+
+        store = CodexAccountStore()
+        if blob:
+            store.write_credential(account_num, email, blob)
+        else:
+            store.delete_credential(account_num, email)
+
+    def _renumber_provider_active(
+        self, data: dict, moves: dict[str, str]
+    ) -> None:
+        """Follow ``activeProviderAccounts`` across a swap or a move."""
+        active = data.get("activeProviderAccounts")
+        if not active:
+            return
+        for provider, slot in list(active.items()):
+            new = moves.get(str(slot))
+            if new is not None:
+                active[provider] = new
 
     def _delete_config_backup(self, account_num: str, email: str) -> None:
         """Delete one slot key's config backup file, if present.
@@ -1303,6 +1356,7 @@ class ClaudeAccountSwitcher:
         # move. Missing material reads as "" (api-key or never-backed-up slot).
         creds = self._read_account_credentials(num_src, email)
         config = self._read_account_config(num_src, email)
+        prov_blob = self._read_provider_material(num_src, email)
 
         src_dir = self._session_dir(num_src, email)
         dst_dir = self._session_dir(target, email)
@@ -1333,6 +1387,7 @@ class ClaudeAccountSwitcher:
                 self._write_account_config(target, email, config)
             else:
                 self._delete_config_backup(target, email)
+            self._put_provider_material(target, email, prov_blob)
 
             data["accounts"][target] = record
             del data["accounts"][num_src]
@@ -1346,6 +1401,7 @@ class ClaudeAccountSwitcher:
             data["sequence"].sort()
             if data.get("activeAccountNumber") == int_src:
                 data["activeAccountNumber"] = int_target
+            self._renumber_provider_active(data, {num_src: target})
             data["lastUpdated"] = get_timestamp()
             # The commit point: _write_json's rename publishes the move.
             self._write_json(self.sequence_file, data)
@@ -1356,6 +1412,7 @@ class ClaudeAccountSwitcher:
             try:
                 self._delete_account_credentials(target, email)
                 self._delete_config_backup(target, email)
+                self._put_provider_material(target, email, "")
                 if dst_dir.exists() and not src_dir.exists():
                     os.replace(dst_dir, src_dir)
             except Exception as e:
@@ -1370,6 +1427,7 @@ class ClaudeAccountSwitcher:
         # (logged loudly: it would poison a future same-email account
         # landing on that slot).
         try:
+            self._put_provider_material(num_src, email, "")
             self._delete_account_files(num_src, email)
         except Exception as e:
             self._logger.error(
