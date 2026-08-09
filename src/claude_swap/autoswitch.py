@@ -426,6 +426,40 @@ class AllExhaustedEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class BackendSwitchEvent(AutoSwitchEvent):
+    """The router now sends running sessions to a different provider.
+
+    Louder than an account switch on purpose: Claude Code's own UI keeps
+    naming a Claude model while a GPT model answers it, so the log line is
+    the only place that says what is really happening.
+    """
+
+    kind: ClassVar[str] = "backend-switched"
+    to_provider: str
+    reason: str
+    account: dict | None = None
+    dry_run: bool = False
+
+    def _fields(self) -> dict:
+        return {
+            "toProvider": self.to_provider,
+            "reason": self.reason,
+            "account": self.account,
+            "dryRun": self.dry_run,
+        }
+
+    def human(self) -> str:
+        prefix = "[dry-run] would move " if self.dry_run else ""
+        if self.to_provider == "claude":
+            return f"{prefix}BACKEND -> Claude ({self.reason})"
+        who = f" as {self.account['email']}" if self.account else ""
+        return (
+            f"{prefix}BACKEND -> Codex{who} ({self.reason}); "
+            "Claude Code still names a Claude model, a GPT model answers"
+        )
+
+
+@dataclass(frozen=True)
 class SleepEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "sleep"
     seconds: float
@@ -660,6 +694,9 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # One-shot warning for a fallback that is configured but cannot act
+        # (the router is not installed, or there is no Codex account).
+        self._fallback_warned = False
 
     # -- state file ---------------------------------------------------------
 
@@ -923,6 +960,18 @@ class AutoSwitchEngine:
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
+
+        # Decided before the per-account logic below, and independent of it:
+        # which backend answers is a different question from which Claude
+        # account is live, and the answer must be right even on a tick that
+        # returns early.
+        try:
+            self._maybe_flip_backend(headroom, quarantined, settings, state)
+        except Exception as exc:
+            # Which backend answers is a side question. A broken settings.json
+            # or a missing router must not stop the account rotation this
+            # engine exists to do.
+            self._warn_fallback(f"the backend check failed: {exc}")
 
         if (
             self.switcher.account_kind_for(current) == "api_key"
@@ -2119,6 +2168,177 @@ class AutoSwitchEngine:
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
+
+    # -- cross-provider fallback ---------------------------------------------
+
+    def _codex_headroom(self) -> list[tuple[float | None, str, str]]:
+        """(headroom, slot, email) per Codex account, best first.
+
+        Read from the stored usage rows, never fetched here. A fallback that
+        polls OpenAI on every tick would spend requests on a backend that is
+        idle almost all of the time; a stale ranking is good enough to choose
+        between two accounts, and the wrong choice costs nothing worse than a
+        second flip.
+        """
+        from claude_swap.router import switching
+
+        slots = switching.codex_slots(self.switcher)
+        if not slots:
+            return []
+        entries = self.switcher.usage_entries_by_account(fetch=set())
+        ranked = []
+        for slot, email in slots:
+            entry = entries.get(slot)
+            value = entry.decision_value() if entry is not None else None
+            room = oauth.account_headroom(
+                value if isinstance(value, dict) else None, ()
+            )
+            ranked.append((room, slot, email))
+        # Unknown headroom sorts last: an account we cannot measure is a
+        # worse bet than one we can, but still better than no backend.
+        ranked.sort(key=lambda item: (item[0] is None, -(item[0] or 0.0), int(item[1])))
+        return ranked
+
+    def _maybe_flip_backend(
+        self,
+        headroom: dict[str, float | None],
+        quarantined: set[str],
+        settings: AutoSwitchSettings,
+        state: dict,
+    ) -> None:
+        """Move the router between providers when Claude runs out, and back.
+
+        Claude accounts must be *measured* to be called exhausted. An
+        unreadable account may be healthy, and flipping the backend on a guess
+        would move every running session to another provider for nothing.
+        """
+        if settings.fallback_provider != "codex":
+            return
+
+        from claude_swap.router import install as router_install, switching
+        from claude_swap.router.mode import read_mode
+
+        mode = read_mode()
+        if mode.pinned:
+            return  # 'cswap backend claude|codex' outranks the engine
+
+        # ``headroom`` is keyed by every account the usage store knows, Codex
+        # slots included. The question is narrower: is there a Claude account
+        # this engine could still switch to. ``switchable_account_numbers``
+        # already drops non-Claude, disabled and unusable slots.
+        eligible = [
+            num
+            for num in self.switcher.switchable_account_numbers()
+            if num not in quarantined
+        ]
+        # An API-key account has no quota to run out of, so while one is in
+        # rotation Claude always has somewhere to go. Counting it as a normal
+        # slot would do the opposite: its headroom is permanently None, so the
+        # "every account measured" test below could never pass and the
+        # fallback the user configured would never fire.
+        has_api_key = settings.include_api_key_accounts and any(
+            self.switcher.account_kind_for(num) == "api_key" for num in eligible
+        )
+        rooms = [
+            headroom.get(num)
+            for num in eligible
+            if self.switcher.account_kind_for(num) != "api_key"
+        ]
+        measured = [room for room in rooms if room is not None]
+        claude_free = has_api_key or any(room > 0 for room in measured)
+        claude_spent = (
+            not has_api_key
+            and bool(rooms)
+            and len(measured) == len(rooms)
+            and not claude_free
+        )
+
+        if mode.provider == "codex" and claude_free:
+            if self._backend_in_cooldown(state):
+                return
+            reason = "a Claude account has headroom again"
+            if self.dry_run:
+                self._emit(
+                    BackendSwitchEvent(
+                        to_provider="claude", reason=reason, dry_run=True
+                    )
+                )
+                return
+            switching.activate_claude(self.switcher, pinned=False)
+            self._note_backend_flip()
+            self._emit(BackendSwitchEvent(to_provider="claude", reason=reason))
+            return
+
+        if mode.provider != "claude" or not claude_spent:
+            return
+
+        if not router_install.is_installed():
+            self._warn_fallback(
+                "autoswitch.fallbackProvider is codex but the router is not "
+                "installed; run 'cswap router install'"
+            )
+            return
+        ranked = self._codex_headroom()
+        if not ranked:
+            self._warn_fallback(
+                "autoswitch.fallbackProvider is codex but no Codex account is "
+                "in the pool; run 'cswap add --provider codex'"
+            )
+            return
+        if self._backend_in_cooldown(state):
+            return
+
+        room, slot, email = ranked[0]
+        if room is not None and room <= 0:
+            self._warn_fallback(
+                "every Codex account is exhausted too; staying on Claude"
+            )
+            return
+        spent_reason = "every Claude account is exhausted"
+        if self.dry_run:
+            self._emit(
+                BackendSwitchEvent(
+                    to_provider="codex",
+                    reason=spent_reason,
+                    account=_ref(slot, email),
+                    dry_run=True,
+                )
+            )
+            return
+        ok, message = switching.activate_codex(
+            self.switcher, slot, email, pinned=False
+        )
+        if not ok:
+            self._warn_fallback(f"could not fall back to Codex: {message}")
+            return
+        self._note_backend_flip()
+        self._fallback_warned = False
+        if message:
+            self._emit(ConfigWarningEvent(message=message))
+        self._emit(
+            BackendSwitchEvent(
+                to_provider="codex",
+                reason=spent_reason,
+                account=_ref(slot, email),
+            )
+        )
+
+    def _warn_fallback(self, message: str) -> None:
+        """Emit a fallback warning once, not on every tick."""
+        if self._fallback_warned:
+            return
+        self._fallback_warned = True
+        self._emit(ConfigWarningEvent(message=message))
+
+    def _backend_in_cooldown(self, state: dict) -> bool:
+        last = state.get("lastBackendFlipAt")
+        if not isinstance(last, (int, float)):
+            return False
+        return (self.clock() - last) < self.settings.cooldown_seconds
+
+    def _note_backend_flip(self) -> None:
+        now = self.clock()
+        self._mutate_state(lambda s: s.__setitem__("lastBackendFlipAt", now))
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")

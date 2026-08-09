@@ -305,10 +305,88 @@ Two departures from the plan for it:
   aborts the whole import before any write instead of restoring a Codex blob as a Claude
   credential.
 
-**Phase 2 — router.** `cswap router install|start|stop|status|uninstall`, the mode file, the
-verbatim Claude passthrough, the CLIProxyAPI handoff, and `cswap backend`.
+**Phase 2 — router. Shipped 2026-08-09.** `cswap router install|uninstall|start|stop|status|serve`
+and `cswap backend claude|codex [<slot>]|auto`. What landed: `router/mode.py` (the mode file and
+its mtime-cached watcher), `router/server.py` (the aiohttp proxy), `router/install.py` (the
+settings edit and the systemd unit), `router/cliproxy.py` (config, credential and process for the
+Codex backend), `router/modelmap.py`, and `router_cli.py`. aiohttp is an extra, `cswap[router]`,
+so the core tool stays dependency-light.
 
-**Phase 3 — cross-provider fallback.** `autoswitch.fallbackProvider`, the `provider_switched`
-event, the flip-back rule, and the TUI backend indicator.
+Verified against `api.anthropic.com` on 2026-08-09: a request through the router and the same
+request sent directly both answer `401 invalid x-api-key` with the same body. 92 tests cover the
+router; the suite is 2108 passing, 3 skipped.
+
+Four rules this phase locks in:
+
+- **Claude mode is a byte-for-byte passthrough.** The body streams, the client's own
+  `Authorization` survives, and the client session runs with `auto_decompress` off. That last one
+  makes `content-encoding` a header the proxy must forward, not strip — stripping it while
+  forwarding a still-gzipped body was a real bug, caught by the live check above.
+- **Codex mode never falls back to Anthropic.** An unreachable CLIProxyAPI is a 503. A fallback
+  would spend exactly the quota the switch exists to protect.
+- **The model name is rewritten in the router, not in CLIProxyAPI.** CLIProxyAPI can alias model
+  names through `oauth-model-alias`, but the mapping would then be static config that goes stale
+  as Codex model names change. The router holds two names in `router/models.json` and corrects
+  them once per process against the backend's own `/v1/models`. Defaults `gpt-5.6-terra` and
+  `gpt-5.6-sol` come from this box's Codex session history — 461 recorded turns.
+- **Exactly one credential reaches CLIProxyAPI.** It load-balances across every file in its
+  auth directory, so a second file there would spread traffic over accounts cswap did not pick.
+  `write_credential` empties the directory on every write.
+
+Two departures from sections 4 and 5:
+
+- **`cswap backend claude` syncs the credential back.** Not in the plan. CLIProxyAPI refreshes the
+  token while it serves, and an OpenAI refresh token is single-use, so without the sync cswap's
+  stored copy is dead the first time the backend refreshes.
+- **`cswap backend auto` only clears the pin.** Nothing moved the backend automatically in
+  Phase 2. Phase 3 added the engine, and the command now reports whichever is true.
+
+**Phase 3 — cross-provider fallback. Shipped 2026-08-09.** `autoswitch.fallbackProvider`
+(choice `off` | `codex`, default `off`), `AutoSwitchEngine._maybe_flip_backend`, the
+`backend-switched` event, and `router/switching.py` — the shared activate/deactivate steps that
+`cswap backend`, `cswap switch` and the engine now all go through. 23 tests; the suite is 2132
+passing, 3 skipped.
+
+The hook runs once per tick, straight after the poll event, before any per-account logic. Which
+backend answers is a different question from which Claude account is live, and the answer has to
+be right even on a tick that returns early.
+
+Four rules this phase locks in:
+
+- **Exhausted means measured.** Every Claude account must have a known headroom at or below zero.
+  One unreadable account holds the flip back. The failure mode being avoided is moving every
+  running session to another provider on a guess.
+- **The headroom map is not Claude-only.** `_collect_scheduled_usage` builds `usage` from every
+  row the usage store holds, Codex slots included, so the fallback filters by
+  `provider_of(num) == "claude"` and drops quarantined slots. Reading the map unfiltered made the
+  engine see a healthy Codex account as a reason to stay on Claude — caught by a test.
+- **A pinned mode outranks the engine.** `cswap backend claude|codex` sets `pinned`, and the
+  engine then leaves the mode file alone in both directions until `cswap backend auto`.
+- **The Codex ranking never polls.** It reads stored usage rows. A fallback that fetched OpenAI
+  every tick would spend requests on a backend that is idle almost all the time, and the worst a
+  stale ranking costs is one extra flip.
+
+Two departures from section 6:
+
+- **The event is `backend-switched`, not `provider_switched`.** Every other event kind in
+  `autoswitch.py` is a hyphenated string; `provider_switched` would have been the only one that
+  was not.
+- **No TUI backend indicator.** `cswap status` grows a `Backend:` line, `cswap router status`
+  reports the whole picture, and the flip is logged by `cswap auto`. The TUI header would need
+  refresh plumbing for a fourth copy of the same fact.
+
+**Installed and proved on this box, 2026-08-09.** CLIProxyAPI 7.2.125 (linux_amd64, sha256
+verified against the release `checksums.txt`) at `~/.local/bin/cli-proxy-api`, then
+`cswap router install`. Codex mode answered a real `/v1/messages` request end to end: a
+`claude-sonnet-4-5` request came back as `gpt-5.6-terra`, a `claude-3-5-haiku` request came back
+as `gpt-5.6-sol`. Claude mode still passes an invalid key straight through to Anthropic for its
+401. Live use found two faults the tests did not:
+
+- **CLIProxyAPI kept running after the flip back to Claude.** Idle, it still refreshes the Codex
+  login every 15 minutes, which rotates a single-use token cswap is no longer watching. The next
+  flip to Codex would publish a spent token. `activate_claude` now stops the process first, then
+  reads the credential back.
+- **The CLIProxyAPI unit was enabled at login.** Same fault at boot. The unit now has no
+  `[Install]` section, and `install_unit` disables any copy an older install enabled.
 
 Each phase is independently useful and independently revertible.

@@ -110,6 +110,14 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 */5 * * * * cswap auto --once --json >> ~/.cswap-auto.log 2>&1
 ```
 
+- **When every Claude account is spent, it can move to Codex instead of waiting.** Off by default; turn it on with `cswap config set autoswitch.fallbackProvider codex`. It needs the [router](#router-change-backend-without-restarting-a-session) installed and at least one Codex account in the pool, and it says so once if either is missing. See the router section for the terms-of-service warning that comes with it.
+  - It flips only when every Claude account is **measured** and at zero headroom. One unreadable account is enough to hold it back — moving every session to another provider on a guess is worse than waiting.
+  - It returns to Claude as soon as any Claude account has headroom again, and takes the backend's refreshed Codex token back into cswap's store on the way.
+  - The cooldown governs both directions, so it cannot flap.
+  - `cswap backend claude` or `cswap backend codex` pins the backend and the engine stops touching it. `cswap backend auto` hands it back.
+  - The flip is logged loudly, and `cswap status` grows a `Backend:` line, because Claude Code's own UI keeps naming a Claude model while a GPT model answers.
+  - `cswap auto --dry-run` reports the decision and the missing parts without moving anything.
+
 Defaults like the threshold and cooldown are configurable with `cswap config set autoswitch.threshold 80` — flags override them (see [Configuration](#configuration)).
 
 </details>
@@ -242,6 +250,59 @@ Not yet supported for Codex accounts: aliases, directory mappings, and macOS Key
 it reads a Codex slot as a broken Claude account. Remove your Codex accounts before you install an
 older version. An export made here also refuses to import into an older `cswap`, by design: it
 aborts the whole import rather than restore a Codex credential as a Claude one.
+
+### Router: change backend without restarting a session
+
+A Codex account normally serves the `codex` CLI, not Claude Code. The router changes that. It
+answers on `http://127.0.0.1:8318`, and Claude Code is pointed at that address instead of
+`api.anthropic.com`. Which backend stands behind the address is then a one-line file, and a
+session already running follows it on its next request.
+
+```bash
+cswap router install     # point Claude Code at the router, install the services
+cswap backend codex      # every session behind the router moves to Codex
+cswap backend codex 9    # ...on account 9 specifically
+cswap backend claude     # back to Anthropic
+cswap router status      # what is installed, what is running, which backend
+cswap router uninstall   # put settings.json back exactly as it was
+```
+
+**Read this before you install it.**
+
+- **Both providers' terms forbid it.** Anthropic does not support Claude Code against a
+  third-party gateway, and OpenAI's terms do not allow a ChatGPT subscription to serve another
+  client. Accounts have been banned for this. It is your decision.
+- **Only sessions started after `cswap router install` can follow a switch.** Claude Code reads
+  `ANTHROPIC_BASE_URL` once, when the process starts. Sessions running now keep talking straight
+  to Anthropic until you restart them, once.
+- **It needs CLIProxyAPI** for the Codex side — cswap supplies the config and the credential and
+  starts the process, but the Anthropic-to-Codex translation is
+  [CLIProxyAPI's](https://github.com/router-for-me/CLIProxyAPI). Claude mode needs nothing extra.
+- **Install the router extra**: `pip install cswap[router]`, or add `--with aiohttp` to your
+  `uv tool install`.
+- **Remote Control and the claude.ai session viewer stop working** while the base URL is not
+  Anthropic's. Your saved login and voice dictation are untouched: the router writes one settings
+  key and no credential variable.
+
+Claude mode is a plain passthrough. The request reaches `api.anthropic.com` with its own
+`Authorization` header, so cswap's account switching works exactly as before.
+
+Codex mode never falls back to Anthropic. An unreachable backend is a 503 — silently spending the
+Claude quota you switched away from would defeat the point.
+
+The model name is rewritten on the way out: a Haiku request goes to the small Codex model,
+everything else to the main one. The two names live in `router/models.json`, and the router
+corrects them against whatever the backend says it can serve.
+
+Switching Codex accounts follows the router. `cswap switch 9` republishes slot 9's credential
+when the router is already in codex mode. It never turns the router on by itself.
+
+`cswap backend claude` takes the backend's refreshed token back into cswap's own store.
+CLIProxyAPI rotates the credential while it serves, and an OpenAI refresh token is single-use.
+
+**Automatic fallback.** With `cswap config set autoswitch.fallbackProvider codex`, `cswap auto`
+moves the backend to Codex once every Claude account is spent, and back again when one recovers.
+See [Automatic switching](#automatic-switching) for the exact conditions.
 
 ## Tips
 
