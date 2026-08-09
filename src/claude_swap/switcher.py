@@ -3451,6 +3451,11 @@ class ClaudeAccountSwitcher:
         outlive the condition that produced it.
         """
         num, email, _, _, is_active, creds, _alias = account_info
+        if self.provider_of(num) != "claude":
+            # A non-Claude blob carries no claudeAiOauth key, so every check
+            # below would read it as credential-less. Its own fetch path
+            # decides instead.
+            return None if creds else USAGE_NO_CREDENTIALS
         if looks_like_api_key(creds):
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
@@ -3466,11 +3471,65 @@ class ClaudeAccountSwitcher:
         # persist) — states that genuinely need the autoswitch ladder.
         return None
 
+    def _fetch_provider_usage(
+        self, provider: str, account_num: str, email: str, creds: str
+    ) -> FetchRecord:
+        """One usage fetch for a non-Claude slot. Never raises.
+
+        Refreshes an expired token first and writes the rotated credential to
+        every copy that held the old one. OpenAI refresh tokens are single use,
+        so a refresh that is not written back does not merely waste work — it
+        leaves the other copy holding a token the server now rejects with
+        ``refresh_token_reused``, which forces a browser re-login.
+        """
+        if not creds:
+            return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
+        if provider != "codex":
+            return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
+
+        from claude_swap.codex_store import CodexAccountStore
+        from claude_swap.providers import codex
+
+        store = CodexAccountStore()
+        blob = creds
+        if codex.is_expired(blob):
+            refreshed = codex.try_refresh(blob)
+            if refreshed.error is not None:
+                if refreshed.error in ("invalid_grant", "no_refresh_token"):
+                    return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+                return FetchRecord(error=refreshed.error)
+            blob = refreshed.credentials
+            store.write_credential(account_num, email, blob)
+            # The live file is a second holder of the same single-use token.
+            # Guarded by identity, so a login made outside cswap is not
+            # overwritten with another account's credential.
+            live = store.read_live()
+            if live:
+                live_identity = codex.identity(live)
+                new_identity = codex.identity(blob)
+                if (
+                    live_identity is not None
+                    and new_identity is not None
+                    and live_identity.account_uuid == new_identity.account_uuid
+                ):
+                    store.write_live(blob)
+
+        try:
+            usage = codex.fetch_usage(blob)
+        except Exception as exc:  # noqa: BLE001 - classified just below
+            kind, retry_after = oauth._classify_usage_error(exc)
+            return FetchRecord(error=kind, retry_after_s=retry_after)
+        return FetchRecord(usage=usage)
+
     def _fetch_account_usage(
         self, account_info: tuple[int, str, str, str, bool, str, str]
     ) -> FetchRecord:
         """One network fetch for one account. Never raises."""
         num, email, _, org_uuid, is_active, creds, _alias = account_info
+
+        provider = self.provider_of(num)
+        if provider != "claude":
+            return self._fetch_provider_usage(provider, str(num), email, creds)
 
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
