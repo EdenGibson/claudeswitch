@@ -312,10 +312,21 @@ class CswapApp(App):
         )
 
     def confirm_remove(self, number: str, email: str) -> None:
+        snap = self.snapshot
+        acc = next(
+            (a for a in (snap.accounts if snap else ()) if a.number == number), None
+        )
+        # A non-Claude account has no config backup, and its live login stays
+        # where it is — say so rather than promise a deletion that never runs.
+        detail = (
+            "Its stored credentials and config backup are deleted."
+            if acc is None or acc.provider == "claude"
+            else f"Its stored {acc.provider} credential is deleted. "
+            f"Your current {acc.provider} login is left alone."
+        )
         self.push_screen(
             ConfirmModal(
-                f"Remove account {number} ({email})?\n\n"
-                "Its stored credentials and config backup are deleted.",
+                f"Remove account {number} ({email})?\n\n" + detail,
                 title="Remove account",
                 yes_label="Remove",
             ),
