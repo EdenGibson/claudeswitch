@@ -85,6 +85,10 @@ class AccountInfo:
     organization_name: str
     added: str
     number: int
+    #: Which credential backend owns this account. A stored entry with no
+    #: provider key came from upstream cswap, which knows only Claude, so the
+    #: default must stay the silent one.
+    provider: str = "claude"
 
     @property
     def is_organization(self) -> bool:
@@ -107,17 +111,23 @@ class AccountInfo:
             organization_name=data.get("organizationName", "") or "",
             added=data.get("added", ""),
             number=number,
+            provider=data.get("provider") or "claude",
         )
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
-        return {
+        payload = {
             "email": self.email,
             "uuid": self.uuid,
             "organizationUuid": self.organization_uuid,
             "organizationName": self.organization_name,
             "added": self.added,
         }
+        # Only a non-default provider is written, so a Claude entry stays
+        # byte-identical to what upstream produces.
+        if self.provider != "claude":
+            payload["provider"] = self.provider
+        return payload
 
 
 @dataclass(frozen=True)
@@ -140,6 +150,7 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    provider: str = "claude"  # credential backend: "claude" | "codex"
 
     @property
     def display_tag(self) -> str:
