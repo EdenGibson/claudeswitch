@@ -80,6 +80,7 @@ from claude_swap.paths import (
     migrate_legacy_backup_dir,
 )
 from claude_swap.process_detection import get_running_instances
+from claude_swap.router import switching as router_switching
 from claude_swap import poll_policy, provider_ops
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
@@ -4467,6 +4468,9 @@ class ClaudeAccountSwitcher:
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
         self._print_other_provider_status(data)
+        backend = router_switching.backend_line()
+        if backend:
+            print(backend)
         return None
 
     def _print_other_provider_status(self, data: dict) -> None:
@@ -5004,6 +5008,7 @@ class ClaudeAccountSwitcher:
             )
         store.write_live(blob)
         self._record_provider_active(provider, str(account_num))
+        note = router_switching.follow_switch(self, provider, str(account_num))
 
         if json_output:
             return {
@@ -5012,9 +5017,11 @@ class ClaudeAccountSwitcher:
                 "provider": provider,
                 "to": account_ref(int(account_num), email),
                 "strategy": "direct",
-                "warnings": [],
+                "warnings": [note] if note else [],
             }
         print(f"{accent('Switched to')} Account-{account_num} ({email}) [{provider}]")
+        if note:
+            print(f"  {dimmed(note)}")
         return None
 
     def _recapture_provider_live(self, provider: str, data: dict) -> None:
@@ -6129,6 +6136,11 @@ class ClaudeAccountSwitcher:
             removed_items.append(
                 f"Session profiles: {', '.join(d.name for d in session_dirs)}"
             )
+
+        # Before the backup dir, always: see tear_down's docstring.
+        router_removed = router_switching.tear_down(self)
+        if router_removed:
+            removed_items.append(router_removed)
 
         # Remove backup directory
         if self.backup_dir.exists():

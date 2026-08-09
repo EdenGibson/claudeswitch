@@ -234,6 +234,15 @@ def get_codex_auth_path() -> Path:
     return get_codex_home() / "auth.json"
 
 
+def get_router_root() -> Path:
+    """Return the cswap router's state directory.
+
+    Holds ``mode.json`` (which backend serves the next request) and
+    ``cliproxy-auth/`` (the one Codex credential CLIProxyAPI may use).
+    """
+    return get_backup_root() / "router"
+
+
 def get_provider_root(provider: str) -> Path:
     """Return the cswap state root for a non-default provider.
 

@@ -902,6 +902,16 @@ def main() -> None:
 
         codex_command(argv[1:])
         return
+    if argv and argv[0] == "router":
+        from claude_swap.router_cli import router_command
+
+        router_command(argv[1:])
+        return
+    if argv and argv[0] == "backend":
+        from claude_swap.router_cli import backend_command
+
+        backend_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -942,6 +952,8 @@ Commands:
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s codex <cmd>                manage Codex (ChatGPT) accounts
+  %(prog)s router <cmd>               local backend router (install/start/status)
+  %(prog)s backend [claude|codex]     which backend answers running sessions
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts

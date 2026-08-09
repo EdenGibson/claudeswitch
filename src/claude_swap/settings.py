@@ -57,6 +57,11 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Which backend answers when every Claude account is exhausted. "codex"
+    # needs the router installed — nothing else can move a running session.
+    # Off by default: routing Claude Code at a ChatGPT subscription is outside
+    # both providers' terms, so it is never turned on for someone by accident.
+    fallback_provider: str = "off"
 
 
 @dataclass(frozen=True)
@@ -134,6 +139,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "fallbackProvider", "fallback_provider", "choice",
+            choices=("off", "codex"),
+            help="Backend to fall back to when every Claude account is spent",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
