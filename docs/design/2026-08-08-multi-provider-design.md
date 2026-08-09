@@ -274,6 +274,37 @@ Two findings from Phase 1 that change how Phase 2 and 3 must be built:
   originally specified, so sending it risked a silent capability downgrade returned with no error.
   Fixed in `be53ebf`.
 
+**Phase 1.5 — the unified account pool. Shipped 2026-08-09.** Phase 1's separate Codex pool
+became one pool. `sequence.json` is the single registry; an account entry carries an optional
+`provider` key, and an entry without one is a Claude account, so existing data reads unchanged.
+`provider_ops.py` routes credential work to the owning backend. `pool_migration.py` folds a
+standalone Phase 1 pool into the registry once, on the next command.
+
+Every main command now takes a Codex slot: `list`, `status`, `switch`, `add --provider codex`,
+`remove`, `swap`, `move`, `run`, `export`, `import`, and the TUI. `cswap codex <sub>` survives as
+an alias that rewrites to the matching main command.
+
+Three rules this phase locks in:
+
+- **Active is per provider.** Claude Code and the Codex CLI read different files, so one global
+  pointer would leave one of them with no credential. `sequence.json` keeps `activeAccountNumber`
+  for Claude and gains `activeProviderAccounts` for the rest.
+- **Auto-rotation never crosses providers.** `switchable_account_numbers()` excludes non-Claude
+  slots, so every autoswitch candidate site is covered by one filter. Phase 2's router is what
+  unblocks crossing.
+- **Downgrading is unsafe once a Codex slot exists.** Upstream 0.24.1 reads one as a broken Claude
+  account. Recorded in the README, not guarded in code.
+
+Two departures from the plan for it:
+
+- **`cswap run` on a Codex slot does not `exec`.** It stays resident and copies the credential back
+  when Codex exits. Codex rotates its refresh token in place and an OpenAI refresh token is single
+  use, so an `exec` would lose the only valid copy.
+- **A Codex export entry carries no `config` key.** There is no Claude config to carry, and the
+  absence doubles as the downgrade guard: an older cswap requires `config` to be an object, so it
+  aborts the whole import before any write instead of restoring a Codex blob as a Claude
+  credential.
+
 **Phase 2 — router.** `cswap router install|start|stop|status|uninstall`, the mode file, the
 verbatim Claude passthrough, the CLIProxyAPI handoff, and `cswap backend`.
 

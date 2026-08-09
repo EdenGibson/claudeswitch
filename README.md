@@ -199,21 +199,32 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 
 ### Codex accounts
 
-`cswap` also manages OpenAI Codex (ChatGPT subscription) accounts, as a pool independent of the
-Claude ones. Their state lives under `<backup directory>/providers/codex/` and nothing about the
-Claude accounts changes.
+`cswap` also manages OpenAI Codex (ChatGPT subscription) accounts. They share one pool with the
+Claude accounts: one slot list, one `cswap list`, one `cswap switch`. Only the credential lives
+apart, under `<backup directory>/providers/codex/`, because the Codex CLI reads
+`~/.codex/auth.json` and Claude Code reads its own file.
 
 ```bash
 codex login                     # Log in as the account you want to add
-cswap codex add                 # Capture it into a slot
-cswap codex list                # Every Codex account, with live 5h/7d usage
-cswap codex list --no-usage     # Same, without the network call
-cswap codex list --json         # Machine-readable
-cswap codex switch 2            # Make slot 2 the live ~/.codex/auth.json
-cswap codex switch a@work.com   # Accounts resolve by email too
-cswap codex status              # Show the active Codex account
-cswap codex remove 2            # Forget an account (leaves your current login alone)
+cswap add --provider codex      # Capture it into the next free slot
+cswap list                      # Every account; Codex rows are tagged (codex)
+cswap switch 9                  # Make slot 9 the live ~/.codex/auth.json
+cswap switch a@work.com         # Accounts resolve by email too
+cswap status                    # Active account, per provider
+cswap run 9                     # Launch codex as slot 9, this terminal only
+cswap remove 9                  # Forget it (leaves your current login alone)
+cswap export backup.cswap       # Carries Codex accounts too
 ```
+
+`cswap codex <command>` still works as an alias — `cswap codex add` is `cswap add --provider
+codex`, and `cswap codex list` is `cswap list`.
+
+**Each provider has its own active account.** Switching to a Codex slot writes
+`~/.codex/auth.json` and nothing else, so your Claude login keeps working. `cswap status` shows
+both.
+
+**Auto-switch never crosses providers.** `cswap auto` and bare `cswap switch` rotate Claude
+accounts only. Pick a Codex account by naming it.
 
 Quota comes from the same rate-limit windows the Codex CLI itself reports, so the 5-hour and
 weekly percentages line up with what `/status` shows inside Codex. A plan that reports no 5-hour
@@ -221,11 +232,16 @@ window simply shows the weekly one.
 
 Switching saves the live credential back to its own slot first, because the Codex CLI refreshes
 tokens in place and OpenAI refresh tokens are single-use. Losing that write would eventually force
-a browser re-login.
+a browser re-login. `cswap run` on a Codex slot does the same on exit, which is why it stays
+resident instead of handing the terminal over.
 
-Not yet supported for Codex accounts: `run` profiles, aliases, directory mappings, auto-switch, the
-TUI dashboard, and macOS Keychain storage (Codex credentials use the file backend on every
-platform).
+Not yet supported for Codex accounts: aliases, directory mappings, and macOS Keychain storage
+(Codex credentials use the file backend on every platform).
+
+**Downgrading is not safe once you hold a Codex account.** An older `cswap` knows only Claude, so
+it reads a Codex slot as a broken Claude account. Remove your Codex accounts before you install an
+older version. An export made here also refuses to import into an older `cswap`, by design: it
+aborts the whole import rather than restore a Codex credential as a Claude one.
 
 ## Tips
 
@@ -251,8 +267,9 @@ platform).
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
-Codex accounts live under the backup directory in `providers/codex/`, with the same
-`sequence.json` + `credentials/` layout and their own `cache/usage.json`.
+Codex credentials live under the backup directory in `providers/codex/credentials/`, and
+`cswap run` profiles for Codex in `providers/codex/sessions/`. The accounts themselves are in
+the main `sequence.json`, alongside the Claude ones.
 
 Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
 
