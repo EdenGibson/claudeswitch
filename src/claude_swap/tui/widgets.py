@@ -309,6 +309,28 @@ def mini_account_text(
     return text
 
 
+def full_card_number(accounts) -> str | None:
+    """Which row gets the expanded card. None when no row is active.
+
+    The Claude-active row wins. Each provider marks its own live account, so
+    a pool with a live Codex login carries ``is_active`` on two rows at once,
+    and drawing a card per flagged row gave two "● active" cards and pushed
+    the minis out of view. The card belongs to the account
+    ``AccountsSnapshot.active_number`` names, the one the switch UI acts on.
+
+    A pool with no Claude row falls back to whatever is active, because the
+    auto screen renders minis off: preferring Claude unconditionally left a
+    Codex-only pool with nothing to draw and a panel reading "no active
+    managed login" over a live account. A Codex row that loses the card keeps
+    its own active marker on its mini line.
+    """
+    active = [acc for acc in accounts if acc.is_active]
+    for acc in active:
+        if acc.provider == "claude":
+            return acc.number
+    return active[0].number if active else None
+
+
 class AccountsPanel(Static):
     """Static account overview: the active account full-size, others as
     one-line minis (in slot order, expanded in place). The dashboard's — and
@@ -338,8 +360,9 @@ class AccountsPanel(Static):
         now = time.time()
         width = (self.size.width or 80) - 2
         blocks: list[Text] = []
+        carded = full_card_number(snap.accounts)
         for acc in snap.accounts:
-            if acc.is_active:
+            if acc.number == carded:
                 blocks.append(
                     account_card_text(
                         acc, width, threshold=app.threshold_pct, now=now,

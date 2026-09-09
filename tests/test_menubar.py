@@ -449,13 +449,17 @@ class _FakeEntry:
 
 
 class _FakeAcct:
-    def __init__(self, number, email, is_active, usage, alias="", disabled=False):
+    def __init__(
+        self, number, email, is_active, usage, alias="", disabled=False,
+        provider="claude",
+    ):
         self.number = number
         self.email = email
         self.is_active = is_active
         self.usage = usage
         self.alias = alias
         self.disabled = disabled
+        self.provider = provider
 
 
 class _FakeSnap:
@@ -494,6 +498,42 @@ def test_adapt_snapshot_shape_and_active_selection():
 
 def test_adapt_snapshot_empty():
     assert menubar._adapt_snapshot(_FakeSnap([])) == menubar.EMPTY_SNAPSHOT
+
+
+def test_adapt_snapshot_titles_the_claude_account_not_the_codex_one():
+    """Each provider marks its own live account, so two rows can be active.
+
+    The menu bar title answers "which Claude account am I on". Taking the
+    last active row let a live Codex login answer it instead, because the
+    Codex slot usually sits after the Claude ones in slot order.
+    """
+    lg = {"five_hour": {"pct": 10.0}}
+    accts = [
+        _FakeAcct("1", "claude@x.com", True, _FakeEntry(last_good=lg)),
+        _FakeAcct("9", "codex@x.com", True, _FakeEntry(), provider="codex"),
+    ]
+
+    snap = menubar._adapt_snapshot(_FakeSnap(accts))
+
+    assert snap["active_email"] == "claude@x.com"
+    assert snap["active_usage"] == lg
+
+
+def test_adapt_snapshot_falls_back_to_codex_when_no_claude_row_is_active():
+    """A Codex-only pool has no Claude row to name.
+
+    format_title returns a bare icon for active_email None (menubar.py:307),
+    so preferring Claude without a fallback emptied the whole title: no
+    account name, no percentages, on a pool that has a live account.
+    """
+    lg = {"five_hour": {"pct": 42.0}}
+    accts = [_FakeAcct("1", "codex@x.com", True, _FakeEntry(last_good=lg),
+                       provider="codex")]
+
+    snap = menubar._adapt_snapshot(_FakeSnap(accts))
+
+    assert snap["active_email"] == "codex@x.com"
+    assert snap["active_usage"] == lg
 
 
 # --- weekly reset roll-forward (static 7-day cadence) --------------------------

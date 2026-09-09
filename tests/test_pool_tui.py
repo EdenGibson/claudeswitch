@@ -9,10 +9,14 @@ import pytest
 
 from claude_swap import paths
 from claude_swap.codex_store import CodexAccountStore
-from claude_swap.models import UsageEntry
+from claude_swap.models import AccountSnapshot, UsageEntry
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.theme import CSWAP_DARK, Palette
-from claude_swap.tui.widgets import account_card_text, mini_account_text
+from claude_swap.tui.widgets import (
+    account_card_text,
+    full_card_number,
+    mini_account_text,
+)
 from tests.providers.conftest import make_codex_auth
 
 CODEX_EMAIL = "codex@example.com"
@@ -125,3 +129,50 @@ def test_the_usage_entry_shape_is_unchanged_for_a_codex_row(pool):
     rows = _by_number(_snapshot(pool))
 
     assert isinstance(rows["2"].usage, UsageEntry)
+
+
+def _row(number: str, email: str, provider: str, *, is_active: bool):
+    return AccountSnapshot(
+        number=number,
+        email=email,
+        org_name="",
+        org_uuid="",
+        is_active=is_active,
+        kind="oauth",
+        switchable=True,
+        usage=UsageEntry(),
+        provider=provider,
+    )
+
+
+def test_only_the_claude_row_gets_the_full_card():
+    """A live login per provider means two rows carry is_active at once.
+
+    The dashboard draws a card per row it calls active, so both providers
+    claiming it produced two "● active" cards and pushed the minis out of
+    view. The expanded card belongs to the Claude account, the one
+    active_number names and the switch UI acts on.
+    """
+    claude = _row("1", "claude@example.com", "claude", is_active=True)
+    codex = _row("2", CODEX_EMAIL, "codex", is_active=True)
+
+    assert full_card_number([claude, codex]) == "1"
+    assert full_card_number([codex, claude]) == "1"
+
+
+def test_an_idle_claude_row_gets_no_card():
+    rows = [_row("3", "cold@example.com", "claude", is_active=False)]
+
+    assert full_card_number(rows) is None
+
+
+def test_a_codex_only_pool_still_gets_a_card():
+    """No Claude row means the Codex row is the only account there is.
+
+    The auto screen renders minis off, so a rule of "Claude rows only" left it
+    with nothing to draw and the panel said "no active managed login" over a
+    live Codex login.
+    """
+    rows = [_row("1", CODEX_EMAIL, "codex", is_active=True)]
+
+    assert full_card_number(rows) == "1"

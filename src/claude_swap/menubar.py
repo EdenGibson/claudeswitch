@@ -420,6 +420,11 @@ def _adapt_snapshot(snap) -> dict:
     active_email = None
     active_usage = None
     active_alias = None
+    # A live non-Claude account, kept only for a pool that has no Claude row
+    # to name. format_title returns a bare icon for active_email None, so
+    # preferring Claude with no fallback emptied the title on a Codex-only
+    # pool: no name, no percentages, over a live account.
+    fallback: tuple | None = None
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
         accounts.append(
@@ -428,8 +433,19 @@ def _adapt_snapshot(snap) -> dict:
                 acc.alias, acc.disabled, acc.usage.fetched_at,
             )
         )
+        # The Claude row wins. Each provider marks its own live account, so a
+        # pool with a live Codex login carries is_active twice, and the last
+        # one won: the title answered "which Claude account am I on" with a
+        # Codex address, because the Codex slot usually sorts after the
+        # Claude ones.
         if acc.is_active:
-            active_email, active_usage, active_alias = acc.email, display, acc.alias
+            row = (acc.email, display, acc.alias)
+            if getattr(acc, "provider", "claude") == "claude":
+                active_email, active_usage, active_alias = row
+            elif fallback is None:
+                fallback = row
+    if active_email is None and fallback is not None:
+        active_email, active_usage, active_alias = fallback
     return {
         "accounts": accounts,
         "active_email": active_email,
