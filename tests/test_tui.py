@@ -1533,6 +1533,18 @@ class TestAutoScreen:
 
 
 class TestEventText:
+    def test_no_switch_names_the_unchanged_thing(self):
+        event = NoSwitchEvent(
+            reason="no-qualifying-candidate",
+            detail="no candidate is below the threshold",
+        )
+        from claude_swap.tui.autoview import event_text
+
+        assert event_text(event).plain.endswith(
+            "Claude account unchanged: no-qualifying-candidate "
+            "(no candidate is below the threshold)"
+        )
+
     def test_switch_event_styling_and_content(self):
         event = SwitchEvent(
             trigger="proactive",

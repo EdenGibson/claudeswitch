@@ -125,6 +125,14 @@ HORIZON_HEADROOM_RATIO = 2.0
 # whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
 
+# The lowest the cross-provider return line may fall. `autoswitch.threshold`
+# and `autoswitch.hysteresisPct` are validated independently and their ranges
+# overlap (50.0-99.9 and 0.0-50.0), so the difference between them reaches
+# zero — a line no utilization can be under, which would strand the router on
+# the fallback provider for good. An account under 1% used holds a window that
+# has effectively just reset, so it always counts as recovered.
+MIN_RETURN_PCT = 1.0
+
 
 def _recovery_is_useful(
     candidate_recovery_ts: float,
@@ -376,7 +384,9 @@ class NoSwitchEvent(AutoSwitchEvent):
         return {"reason": self.reason, "detail": self.detail}
 
     def human(self) -> str:
-        return f"no switch: {self.reason}" + (f" ({self.detail})" if self.detail else "")
+        return f"Claude account unchanged: {self.reason}" + (
+            f" ({self.detail})" if self.detail else ""
+        )
 
 
 @dataclass(frozen=True)
@@ -2211,6 +2221,25 @@ class AutoSwitchEngine:
         Claude accounts must be *measured* to be called exhausted. An
         unreadable account may be healthy, and flipping the backend on a guess
         would move every running session to another provider for nothing.
+
+        "Exhausted" is ``settings.threshold``, the same line rotation uses, not
+        zero headroom. Counting the last few points below 100% as a reason to
+        stay held the backend on a fleet the user had already declared spent.
+
+        Rotation keeps cycling those accounts rather than stopping — with
+        every account over the line ``_rank_candidates`` takes its ``all_above``
+        path and lands on whichever recovers first. Both agree the fleet is
+        spent; they differ in what to do about it, and moving to the backend
+        the user opted into beats waiting for a window to reset. Deliberate,
+        and the reason ``fallbackProvider`` is off by default.
+
+        Leaving and returning use different lines. Claude is spent at or above
+        ``threshold`` utilization; it is free again only below
+        ``threshold - hysteresis_pct``. Between them nothing moves. Every
+        session behind the router follows this flip, so an account grazing the
+        threshold must not be able to drag them back and forth — the same
+        reason rotation carries a hysteresis margin, and the cooldown alone is
+        a delay rather than a margin.
         """
         if settings.fallback_provider != "codex":
             return
@@ -2245,12 +2274,27 @@ class AutoSwitchEngine:
             if self.switcher.account_kind_for(num) != "api_key"
         ]
         measured = [room for room in rooms if room is not None]
-        claude_free = has_api_key or any(room > 0 for room in measured)
+        # Utilization, so both lines read the way the settings are written:
+        # threshold 90 means "switch at 90% used", hysteresis 10 means the
+        # return needs 10 points better than that.
+        #
+        # Floored, because the two settings are validated apart and their
+        # ranges overlap: threshold 50 (its minimum) with hysteresisPct 50
+        # (its maximum) puts the return line at zero, which no utilization can
+        # be under. The fallback would become a one-way door, and a window
+        # that had fully reset could not bring the sessions home. A band may
+        # shrink to almost nothing; it may not close.
+        return_below = max(
+            settings.threshold - settings.hysteresis_pct, MIN_RETURN_PCT
+        )
+        claude_free = has_api_key or any(
+            (100.0 - room) < return_below for room in measured
+        )
         claude_spent = (
             not has_api_key
             and bool(rooms)
             and len(measured) == len(rooms)
-            and not claude_free
+            and all((100.0 - room) >= settings.threshold for room in measured)
         )
 
         if mode.provider == "codex" and claude_free:

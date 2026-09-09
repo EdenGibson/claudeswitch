@@ -111,9 +111,9 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 ```
 
 - **When every Claude account is spent, it can move to Codex instead of waiting.** Off by default; turn it on with `cswap config set autoswitch.fallbackProvider codex`. It needs the [router](#router-change-backend-without-restarting-a-session) installed and at least one Codex account in the pool, and it says so once if either is missing. See the router section for the terms-of-service warning that comes with it.
-  - It flips only when every Claude account is **measured** and at zero headroom. One unreadable account is enough to hold it back — moving every session to another provider on a guess is worse than waiting.
-  - It returns to Claude as soon as any Claude account has headroom again, and takes the backend's refreshed Codex token back into cswap's store on the way.
-  - The cooldown governs both directions, so it cannot flap.
+  - It flips only when every Claude account is **measured** and every one has reached `autoswitch.threshold` — the same line rotation uses, not zero headroom. An account at 97% used is one rotation would never land on, so counting its last 3 points as a reason to stay would hold the backend on accounts the engine has already given up on. One unreadable account is enough to hold the flip back: moving every session to another provider on a guess is worse than waiting.
+  - It returns to Claude once an account recovers past `threshold - autoswitch.hysteresisPct` — 10 points better than the line it left on, by default. Between the two lines nothing moves, so an account grazing the threshold cannot drag every session back and forth. It takes the backend's refreshed Codex token back into cswap's store on the way.
+  - The cooldown governs both directions too, so a flip is delayed as well as damped.
   - `cswap backend claude` or `cswap backend codex` pins the backend and the engine stops touching it. `cswap backend auto` hands it back.
   - The flip is logged loudly, and `cswap status` grows a `Backend:` line, because Claude Code's own UI keeps naming a Claude model while a GPT model answers.
   - `cswap auto --dry-run` reports the decision and the missing parts without moving anything.
@@ -231,8 +231,10 @@ codex`, and `cswap codex list` is `cswap list`.
 `~/.codex/auth.json` and nothing else, so your Claude login keeps working. `cswap status` shows
 both.
 
-**Auto-switch never crosses providers.** `cswap auto` and bare `cswap switch` rotate Claude
-accounts only. Pick a Codex account by naming it.
+**Account rotation never crosses providers.** `cswap auto` and bare `cswap switch` rotate Claude
+accounts only. Pick a Codex account by naming it. Moving the *backend* between providers is a
+separate decision, made by `cswap backend` or by
+[`autoswitch.fallbackProvider`](#automatic-switching); neither one rotates a Codex account.
 
 Quota comes from the same rate-limit windows the Codex CLI itself reports, so the 5-hour and
 weekly percentages line up with what `/status` shows inside Codex. A plan that reports no 5-hour

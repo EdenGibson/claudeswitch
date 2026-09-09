@@ -117,6 +117,25 @@ class TestFlipToCodex:
         _tick(spent, {"1": 100.0, "2": 40.0})
         assert read_mode().provider == "claude"
 
+    def test_an_account_over_the_threshold_does_not_stop_it(self, spent):
+        # 97% used is past the 90% switch threshold, so its 3 points of
+        # headroom are not somewhere the engine would ever send a session.
+        # Counting them as "free" is what kept the backend on Claude while
+        # every account was over the line.
+        _tick(spent, {"1": 100.0, "2": 97.0})
+        assert read_mode().provider == "codex"
+
+    def test_an_account_below_the_threshold_stops_it(self, spent):
+        # At the threshold the engine already wants off the account, so the
+        # boundary sits just under it: 89% used is somewhere to land, 90% is
+        # not. Same comparison rotation uses.
+        _tick(spent, {"1": 100.0, "2": 89.0})
+        assert read_mode().provider == "claude"
+
+    def test_an_account_exactly_at_the_threshold_does_not_stop_it(self, spent):
+        _tick(spent, {"1": 100.0, "2": 90.0})
+        assert read_mode().provider == "codex"
+
     def test_an_unmeasured_account_stops_it(self, spent):
         _tick(spent, {"1": 100.0, "2": None})
         assert read_mode().provider == "claude"
@@ -234,6 +253,55 @@ class TestFlipBack:
         spent.clock.advance(spent.settings.cooldown_seconds + 1)
 
         _tick(spent, {"1": 10.0, "2": 100.0})
+
+        assert read_mode().provider == "claude"
+
+    def test_a_recovery_inside_the_hysteresis_band_is_not_enough(self, spent):
+        # Leaving needs utilization over the threshold (90); returning needs it
+        # under threshold - hysteresis (80). 85% used sits in the band: past
+        # the leave line, short of the return line, so the backend stays put
+        # rather than flipping on an account grazing the threshold.
+        _tick(spent, {"1": 100.0, "2": 100.0})
+        assert read_mode().provider == "codex"
+        spent.clock.advance(spent.settings.cooldown_seconds + 1)
+
+        _tick(spent, {"1": 85.0, "2": 100.0})
+
+        assert read_mode().provider == "codex"
+
+    def test_a_recovery_past_the_hysteresis_band_returns(self, spent):
+        _tick(spent, {"1": 100.0, "2": 100.0})
+        spent.clock.advance(spent.settings.cooldown_seconds + 1)
+
+        _tick(spent, {"1": 79.0, "2": 100.0})
+
+        assert read_mode().provider == "claude"
+
+    def test_the_widest_band_the_settings_allow_still_returns(self, temp_home: Path):
+        """threshold 50 with hysteresisPct 50 puts the return line at zero.
+
+        Both values pass their own SETTING_SPECS bounds (settings.py:111 and
+        :123), and subtracting one from the other leaves a line no utilization
+        can be under. Without a floor the fallback becomes a one-way door: the
+        backend goes to Codex once and no Claude recovery, not even a window
+        that has fully reset, can bring the sessions back.
+        """
+        harness = EngineHarness(
+            temp_home,
+            fallback_provider="codex",
+            threshold=50.0,
+            hysteresis_pct=50.0,
+        )
+        harness.seed(1, "a@example.com")
+        harness.make_live("a@example.com", 1)
+        _add_codex(harness, *CODEX_A)
+        _install_router(temp_home)
+
+        _tick(harness, {"1": 100.0})
+        assert read_mode().provider == "codex"
+        harness.clock.advance(harness.settings.cooldown_seconds + 1)
+
+        _tick(harness, {"1": 0.0})
 
         assert read_mode().provider == "claude"
 
