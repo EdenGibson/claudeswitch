@@ -18,6 +18,8 @@ router does.
 
 from __future__ import annotations
 
+import logging
+
 from claude_swap.printer import accent, bolded, dimmed
 from claude_swap.router import cliproxy
 from claude_swap.router import install as router_install
@@ -175,6 +177,63 @@ def follow_switch(switcher, provider: str, account_num: str) -> str:
         return f"the router is still serving Account-{mode.slot}: {message}"
     except Exception as exc:  # the switch itself must still succeed
         return f"the router did not follow the switch: {exc}"
+
+
+def detach_from(switcher, slot: str) -> str:
+    """Return the backend to Claude when it is serving ``slot``.
+
+    Called before a Codex slot's credential is deleted. CLIProxyAPI refreshes
+    the login while it serves and an OpenAI refresh token is single use, so
+    the rotation has to come back out of the backend first: afterwards the
+    stored copy is gone and the live ``~/.codex/auth.json`` that ``remove``
+    deliberately leaves behind would hold a token the server has retired.
+
+    Returns a line for the caller's report, or "" when the router was serving
+    something else. Never raises: removing an account must finish either way.
+    """
+    try:
+        mode = read_mode()
+        if mode.provider != "codex" or mode.slot != str(slot):
+            return ""
+        activate_claude(switcher, pinned=False)
+        return f"the router returned to Claude: Account-{slot} was its backend"
+    except Exception as exc:  # the removal itself must still finish
+        return f"the router did not release Account-{slot}: {exc}"
+
+
+def follow_renumber(moves: dict[str, str]) -> str:
+    """Point the mode file at a Codex slot's new number after a swap or move.
+
+    ``moves`` maps old slot to new slot. The account behind the slot has not
+    changed, only its number, and its credential moved with it, so the backend
+    keeps serving and only the name it is filed under changes. Returning to
+    Claude would stop a backend that is still correct; leaving the old number
+    is worse, because the next ``sync_back`` would then read a slot holding a
+    different account.
+
+    Returns the new slot when the mode file moved, else "". Never raises: the
+    renumber it follows has already been committed, and undoing it is not on
+    offer. A failure is logged rather than swallowed, because the mode file is
+    then left naming a slot that now holds a different account, and the next
+    ``sync_back`` would merge the backend's rotated token into the wrong one.
+    """
+    try:
+        mode = read_mode()
+        if mode.provider != "codex" or mode.slot is None:
+            return ""
+        new = moves.get(str(mode.slot))
+        if new is None:
+            return ""
+        write_mode(RouterMode(provider="codex", slot=str(new), pinned=mode.pinned))
+        return new
+    except Exception as exc:
+        logging.getLogger("claude-swap").warning(
+            "the router's backend slot could not be updated (%s). Its mode "
+            "file may still name a slot that now holds another account. Run "
+            "'cswap backend claude', then pick the backend again.",
+            exc,
+        )
+        return ""
 
 
 def tear_down(switcher) -> str:

@@ -972,6 +972,12 @@ class ClaudeAccountSwitcher:
                 self._logger.error(f"Provider credential restore failed: {e}")
             raise
 
+        # The router files its backend by slot number, so it has to be told
+        # too. Out here, not inside the try: the write above is the commit
+        # point, and anything after it under `except BaseException` would let
+        # a Ctrl-C roll both credentials back to a swap already published.
+        router_switching.follow_renumber({num_a: num_b, num_b: num_a})
+
         # Post-commit cleanup, all best-effort: the records already reference
         # the new keys only. A failure here leaks a stale file, never a wrong
         # read — logged loudly because a stale key under a freed slot would
@@ -1419,6 +1425,12 @@ class ClaudeAccountSwitcher:
             except Exception as e:
                 self._logger.error(f"Cleanup after failed move incomplete: {e}")
             raise
+
+        # The router files its backend by slot number, so it has to be told
+        # too. Out here, not inside the try: the write above is the commit
+        # point, and anything after it under `except BaseException` would let
+        # a Ctrl-C roll the credential back to a move already published.
+        router_switching.follow_renumber({num_src: target})
 
         # Post-commit: clear the old keys, best effort — the records now
         # reference the target slot only. _delete_account_files drops the
@@ -2919,10 +2931,15 @@ class ClaudeAccountSwitcher:
                 return
 
         # Remove backup files
+        detached = ""
         provider = account_info.get("provider") or "claude"
         if provider == "claude":
             self._delete_account_files(account_num, email)
         else:
+            # Before the credential goes, not after: the router may be serving
+            # this very slot, and the rotated token it holds has nowhere to
+            # come back to once the stored copy is deleted.
+            detached = router_switching.detach_from(self, account_num)
             self._delete_provider_files(provider, account_num, email)
             active_map = data.get("activeProviderAccounts") or {}
             if str(active_map.get(provider)) == account_num:
@@ -2936,6 +2953,9 @@ class ClaudeAccountSwitcher:
         self._write_json(self.sequence_file, data)
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
+        if detached:
+            # Under the headline it belongs to, like every other detail line.
+            print(f"  {dimmed(detached)}")
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
 
