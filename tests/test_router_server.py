@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -329,3 +330,138 @@ def test_an_unmatched_model_is_not_replaced_by_an_arbitrary_one(temp_home: Path)
     kept = reconcile(ModelMap(main="gone", small="also-gone"), ["claude-opus-5"])
 
     assert kept.main == "gone"
+
+
+def _hang_up_on(monkeypatch, method: str) -> None:
+    """Make one StreamResponse step fail the way a vanished client makes it fail.
+
+    aiohttp raises ``ClientConnectionResetError`` from the transport write
+    when the peer is gone. Reproducing that from a real socket needs timing
+    the router does not control, so the exception is injected at the step
+    the production tracebacks name.
+    """
+    from aiohttp import ClientConnectionResetError
+    from aiohttp import web as aiohttp_web
+
+    real = getattr(aiohttp_web.StreamResponse, method)
+
+    async def gone(self, *args, **kwargs):
+        # Only the router's own streamed response, never the fake upstream's:
+        # the patch is on the shared base class, and the upstream answers with
+        # a Response subclass. Nothing reaches the wire, matching a transport
+        # that is already closing, so the response never starts and aiohttp is
+        # free to treat the escape as a handler fault and log it.
+        if type(self) is aiohttp_web.StreamResponse:
+            raise ClientConnectionResetError("Cannot write to closing transport")
+        return await real(self, *args, **kwargs)
+
+    monkeypatch.setattr(aiohttp_web.StreamResponse, method, gone)
+
+
+def _talk_to_a_vanished_client(mode_file: Path) -> None:
+    seen: list[dict] = []
+
+    async def go():
+        upstream = TestServer(_echo_app(seen))
+        await upstream.start_server()
+        base = str(upstream.make_url("")).rstrip("/")
+        router = Router(mode_path=mode_file, anthropic_upstream=base)
+        proxy = TestServer(build_app(router))
+        await proxy.start_server()
+        try:
+            async with ClientSession() as session:
+                async with session.post(
+                    str(proxy.make_url("/v1/messages")), data=b"{}"
+                ) as response:
+                    await response.read()
+        except Exception:
+            # The connection dies, which is the point. Only the server's own
+            # logging is under test.
+            pass
+        finally:
+            await proxy.close()
+            await upstream.close()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("step", ["prepare", "write_eof"])
+def test_a_client_that_hangs_up_is_not_a_handler_failure(
+    temp_home: Path, caplog, monkeypatch, step: str
+):
+    """Claude Code cancels requests routinely, and the client then vanishes.
+
+    Writing the response head or its terminator fails, which is the client's
+    decision and not a fault in the router. aiohttp's own ``finish_response``
+    treats a ``ConnectionError`` at these two steps as a premature disconnect;
+    letting one escape the handler instead logs a full traceback per request.
+    Measured on this box before the guard: 1628 escapes from ``prepare`` and
+    51 from ``write_eof`` in 24 hours.
+    """
+    path = temp_home / "mode.json"
+    write_mode(RouterMode(provider="claude"), path)
+    _hang_up_on(monkeypatch, step)
+
+    with caplog.at_level(logging.DEBUG):
+        _talk_to_a_vanished_client(path)
+
+    assert "Error handling request" not in caplog.text
+
+
+def test_a_hangup_mid_stream_is_not_a_warning(temp_home: Path, caplog, monkeypatch):
+    """One disconnect, one severity, wherever it lands.
+
+    The same vanished client fails ``write`` mid-body instead of ``prepare``,
+    and that path shares its handler with real upstream failures. Reporting it
+    as "stream interrupted" at WARNING put a routine cancellation next to a
+    backend that died halfway through an answer.
+    """
+    path = temp_home / "mode.json"
+    write_mode(RouterMode(provider="claude"), path)
+    _hang_up_on(monkeypatch, "write")
+
+    with caplog.at_level(logging.DEBUG):
+        _talk_to_a_vanished_client(path)
+
+    assert "stream interrupted" not in caplog.text
+    assert "client disconnected" in caplog.text
+
+
+def test_an_upstream_that_dies_mid_stream_is_still_a_warning(temp_home: Path, caplog):
+    """The backend failing halfway through an answer is worth saying loudly."""
+    path = temp_home / "mode.json"
+    write_mode(RouterMode(provider="claude"), path)
+
+    async def go():
+        async def handler(request):
+            response = web.StreamResponse()
+            await response.prepare(request)
+            await response.write(b'{"partial"')
+            # Drop the connection with the body unfinished.
+            request.transport.abort()
+            return response
+
+        upstream_app = web.Application()
+        upstream_app.router.add_route("*", "/{path:.*}", handler)
+        upstream = TestServer(upstream_app)
+        await upstream.start_server()
+        base = str(upstream.make_url("")).rstrip("/")
+        router = Router(mode_path=path, anthropic_upstream=base)
+        proxy = TestServer(build_app(router))
+        await proxy.start_server()
+        try:
+            async with ClientSession() as session:
+                async with session.post(
+                    str(proxy.make_url("/v1/messages")), data=b"{}"
+                ) as response:
+                    await response.read()
+        except Exception:
+            pass
+        finally:
+            await proxy.close()
+            await upstream.close()
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(go())
+
+    assert "stream interrupted" in caplog.text

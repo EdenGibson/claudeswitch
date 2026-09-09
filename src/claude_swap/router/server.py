@@ -293,15 +293,33 @@ class Router:
         # Chunked, so a token stream reaches the client as it arrives instead
         # of after the whole answer is buffered.
         response.enable_chunked_encoding()
-        await response.prepare(request)
         try:
-            async for chunk in upstream_response.content.iter_any():
-                await response.write(chunk)
-        except (aiohttp.ClientError, ConnectionResetError) as exc:
-            _logger.warning("stream interrupted: %s", exc)
+            await response.prepare(request)
+            try:
+                async for chunk in upstream_response.content.iter_any():
+                    await response.write(chunk)
+            except ConnectionError:
+                # The client, not the backend. Writing to a closed transport
+                # is the only failure here that is a ConnectionError: every
+                # upstream mode (ServerDisconnectedError, ClientPayloadError,
+                # ServerTimeoutError, ClientOSError) is a ClientError and not
+                # a ConnectionError. Hand it to the guard below so one
+                # disconnect reads the same wherever in the response it lands.
+                raise
+            except aiohttp.ClientError as exc:
+                _logger.warning("stream interrupted: %s", exc)
+            await response.write_eof()
+        except ConnectionError as exc:
+            # The client hung up before the response head or its terminator
+            # reached the wire. Claude Code cancels requests routinely, so
+            # this is the client's decision and not a fault in the router.
+            # aiohttp's own finish_response catches ConnectionError around
+            # exactly these two calls and records a premature disconnect;
+            # letting one escape the handler instead turns every cancelled
+            # request into a logged traceback and a 500 nobody reads.
+            _logger.debug("client disconnected: %s", exc)
         finally:
             upstream_response.release()
-        await response.write_eof()
         return response
 
 
