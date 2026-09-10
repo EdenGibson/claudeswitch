@@ -37,6 +37,21 @@ def codex_slots(switcher) -> list[tuple[str, str]]:
     return sorted(found, key=lambda pair: int(pair[0]) if pair[0].isdigit() else 0)
 
 
+def router_serves(slot: str) -> bool:
+    """Whether CLIProxyAPI is currently serving this Codex slot.
+
+    While it is, the backend owns that token family: it refreshes on its own
+    cadence and holds a copy cswap did not write. Callers use this to keep
+    their hands off a refresh that would retire the backend's token.
+
+    Reads the mode file, which is one small JSON read, so it is cheap enough
+    to ask per fetch rather than caching an answer that a flip can invalidate
+    at any moment.
+    """
+    mode = read_mode()
+    return mode.provider == "codex" and mode.slot == str(slot)
+
+
 def blob_for(switcher, slot: str, email: str) -> str:
     """A slot's Codex credential: the live file when it owns it, else the store.
 

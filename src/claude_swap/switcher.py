@@ -3678,6 +3678,15 @@ class ClaudeAccountSwitcher:
         so a refresh that is not written back does not merely waste work — it
         leaves the other copy holding a token the server now rejects with
         ``refresh_token_reused``, which forces a browser re-login.
+
+        One slot is exempt from that refresh: the Codex account CLIProxyAPI is
+        serving. The backend refreshes that family itself every 15 minutes and
+        holds its own copy, so a refresh taken here retires the token the
+        backend still has, and the backend's next refresh kills the login. A
+        usage reading must not be able to do that. Instead the backend's own
+        rotation is read back first, and an expired token is reported rather
+        than refreshed — the backend renews it on its own cadence, and the
+        next poll sees the new one.
         """
         if not creds:
             return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
@@ -3686,10 +3695,16 @@ class ClaudeAccountSwitcher:
 
         from claude_swap.codex_store import CodexAccountStore
         from claude_swap.providers import codex
+        from claude_swap.router import switching as router_switching
 
         store = CodexAccountStore()
         blob = creds
-        if codex.is_expired(blob):
+        if router_switching.router_serves(str(account_num)):
+            if router_switching.sync_back(self, str(account_num)):
+                blob = self._read_provider_material(str(account_num), email) or blob
+            if codex.is_expired(blob):
+                return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+        elif codex.is_expired(blob):
             refreshed = codex.try_refresh(blob)
             if refreshed.error is not None:
                 if refreshed.error in ("invalid_grant", "no_refresh_token"):
