@@ -113,7 +113,8 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 - **When every Claude account is spent, it can move to Codex instead of waiting.** Off by default; turn it on with `cswap config set autoswitch.fallbackProvider codex`. It needs the [router](#router-change-backend-without-restarting-a-session) installed and at least one Codex account in the pool, and it says so once if either is missing. See the router section for the terms-of-service warning that comes with it.
   - It flips only when every Claude account is **measured** and every one has reached `autoswitch.threshold` — the same line rotation uses, not zero headroom. An account at 97% used is one rotation would never land on, so counting its last 3 points as a reason to stay would hold the backend on accounts the engine has already given up on. One unreadable account is enough to hold the flip back: moving every session to another provider on a guess is worse than waiting.
   - It returns to Claude once an account recovers past `threshold - autoswitch.hysteresisPct` — 10 points better than the line it left on, by default. Between the two lines nothing moves, so an account grazing the threshold cannot drag every session back and forth. It takes the backend's refreshed Codex token back into cswap's store on the way.
-  - The cooldown governs both directions too, so a flip is delayed as well as damped.
+  - **It rotates between Codex accounts too, once it is on one.** Through a long Claude outage that first Codex account carries every session until it reaches its own limit, so at `threshold` the engine moves to the Codex account with the most headroom, on the same two lines. An unmeasured account is never called spent and never chosen as a target. With every Codex account over the line it stays put and says so once. Returning to Claude outranks rotating, and while the router serves a Codex account the engine polls it on the normal cadence — nothing else in its schedule does.
+  - The cooldown governs both directions too, so a flip is delayed as well as damped. A rotation between Codex accounts is the same class of move and takes the same cooldown.
   - `cswap backend claude` or `cswap backend codex` pins the backend and the engine stops touching it. `cswap backend auto` hands it back.
   - The flip is logged loudly, and `cswap status` grows a `Backend:` line, because Claude Code's own UI keeps naming a Claude model while a GPT model answers.
   - `cswap auto --dry-run` reports the decision and the missing parts without moving anything.
@@ -234,7 +235,12 @@ both.
 **Account rotation never crosses providers.** `cswap auto` and bare `cswap switch` rotate Claude
 accounts only. Pick a Codex account by naming it. Moving the *backend* between providers is a
 separate decision, made by `cswap backend` or by
-[`autoswitch.fallbackProvider`](#automatic-switching); neither one rotates a Codex account.
+[`autoswitch.fallbackProvider`](#automatic-switching).
+
+One case does rotate a Codex account automatically: `cswap auto` with
+[`autoswitch.fallbackProvider codex`](#automatic-switching), once it has already moved the router
+onto Codex and that account reaches its own limit. It stays inside the Codex accounts, and it only
+ever touches the account the router is serving.
 
 Quota comes from the same rate-limit windows the Codex CLI itself reports, so the 5-hour and
 weekly percentages line up with what `/status` shows inside Codex. A plan that reports no 5-hour
@@ -304,7 +310,13 @@ CLIProxyAPI rotates the credential while it serves, and an OpenAI refresh token 
 
 **Automatic fallback.** With `cswap config set autoswitch.fallbackProvider codex`, `cswap auto`
 moves the backend to Codex once every Claude account is spent, and back again when one recovers.
-See [Automatic switching](#automatic-switching) for the exact conditions.
+It also rotates between Codex accounts while it is on one, so a long outage is not capped by the
+first Codex account's own weekly window. See [Automatic switching](#automatic-switching) for the
+exact conditions.
+
+While CLIProxyAPI serves a Codex account it owns that token family, so cswap reads the backend's
+rotation rather than taking its own. A usage poll of the account being served will never refresh
+its token: the refresh is single-use, and taking it would retire the copy the backend still holds.
 
 ## Tips
 
@@ -428,7 +440,7 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 
 </details>
 
-`cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
+`cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `backend-switched`, `codex-rotated`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
 
 ### Add an account from a raw token or API key
 

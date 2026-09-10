@@ -470,6 +470,37 @@ class BackendSwitchEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class CodexRotateEvent(AutoSwitchEvent):
+    """The router stayed on Codex and changed which Codex account serves it.
+
+    Separate from :class:`BackendSwitchEvent` because nothing about the
+    session changed: the same GPT model answers the same way, on a different
+    account. A consumer that alerts on a provider change would cry wolf here.
+    """
+
+    kind: ClassVar[str] = "codex-rotated"
+    leaving: dict
+    account: dict
+    reason: str
+    dry_run: bool = False
+
+    def _fields(self) -> dict:
+        return {
+            "leaving": self.leaving,
+            "account": self.account,
+            "reason": self.reason,
+            "dryRun": self.dry_run,
+        }
+
+    def human(self) -> str:
+        prefix = "[dry-run] would move " if self.dry_run else ""
+        return (
+            f"{prefix}CODEX -> {self.account['email']} "
+            f"(from {self.leaving['email']}: {self.reason})"
+        )
+
+
+@dataclass(frozen=True)
 class SleepEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "sleep"
     seconds: float
@@ -707,6 +738,10 @@ class AutoSwitchEngine:
         # One-shot warning for a fallback that is configured but cannot act
         # (the router is not installed, or there is no Codex account).
         self._fallback_warned = False
+        # One-shot warning for a Codex rotation that has nowhere to go. Kept
+        # apart from ``_fallback_warned`` so the two cannot mask each other:
+        # they describe different states and clear at different times.
+        self._rotation_warned = False
 
     # -- state file ---------------------------------------------------------
 
@@ -2181,21 +2216,32 @@ class AutoSwitchEngine:
 
     # -- cross-provider fallback ---------------------------------------------
 
-    def _codex_headroom(self) -> list[tuple[float | None, str, str]]:
+    def _codex_headroom(
+        self, fetch: set[str] | None = None
+    ) -> list[tuple[float | None, str, str]]:
         """(headroom, slot, email) per Codex account, best first.
 
-        Read from the stored usage rows, never fetched here. A fallback that
-        polls OpenAI on every tick would spend requests on a backend that is
-        idle almost all of the time; a stale ranking is good enough to choose
-        between two accounts, and the wrong choice costs nothing worse than a
-        second flip.
+        ``fetch`` names the slots this pass may measure; the default measures
+        none and serves every row from the store. The flip onto Codex takes
+        that default deliberately: polling OpenAI on every tick would spend
+        requests on a backend that is idle almost all of the time, and a stale
+        ranking is good enough to choose between two accounts when the wrong
+        choice costs nothing worse than a second flip.
+
+        Rotation passes a set, because by then the stale row is the whole
+        problem: the account being left is one the engine has been sitting on
+        for hours, and nothing else in the engine's schedule polls a Codex
+        slot. ``scheduled=True`` keeps that under the same adaptive cadence
+        every other account gets rather than fetching on every tick.
         """
         from claude_swap.router import switching
 
         slots = switching.codex_slots(self.switcher)
         if not slots:
             return []
-        entries = self.switcher.usage_entries_by_account(fetch=set())
+        entries = self.switcher.usage_entries_by_account(
+            fetch=fetch or set(), scheduled=True
+        )
         ranked = []
         for slot, email in slots:
             entry = entries.get(slot)
@@ -2313,6 +2359,12 @@ class AutoSwitchEngine:
             self._emit(BackendSwitchEvent(to_provider="claude", reason=reason))
             return
 
+        if mode.provider == "codex":
+            # Already on the fallback and no Claude account has come back.
+            # The only move left is between Codex accounts.
+            self._maybe_rotate_codex(mode, settings, state)
+            return
+
         if mode.provider != "claude" or not claude_spent:
             return
 
@@ -2367,11 +2419,125 @@ class AutoSwitchEngine:
             )
         )
 
+    def _maybe_rotate_codex(
+        self, mode, settings: AutoSwitchSettings, state: dict
+    ) -> None:
+        """Move the router onto a fresher Codex account when the live one is spent.
+
+        The fallback picks a Codex account once and then stops looking. Through
+        a long Claude outage that one account carries every session behind the
+        router until it hits its own limit, and from there each request is an
+        error the user has to read to understand. A second Codex account with a
+        full window sitting unused beside it is the case this exists for.
+
+        Both lines are the fallback's, unchanged. Leaving needs utilization at
+        or above ``threshold``; arriving needs it below
+        ``threshold - hysteresis_pct``. Sharing them is the point rather than a
+        shortcut: a user who moved the threshold to say when an account is
+        spent means the same thing about a Codex account.
+
+        Three states deliberately do nothing. An unmeasured live account is not
+        spent — the same rule the flip itself follows, since a reading we could
+        not take is not a reading of zero. An unmeasured target cannot be shown
+        to be better. And every account over the line means the fleet is spent,
+        where moving buys nothing and costs a token rotation.
+
+        Returning to Claude outranks all of this and the caller has already
+        decided it. Codex is the fallback; a Claude account with headroom is
+        what the user pays for.
+        """
+        from claude_swap.router import switching
+
+        if mode.slot is None:
+            return
+        # One account's cadence while nothing is wrong. Nothing else in the
+        # engine's schedule polls a Codex slot, so without this the row backing
+        # every decision below ages from the moment the fallback lands on it.
+        ranked = self._codex_headroom({mode.slot})
+        rooms = {slot: room for room, slot, _email in ranked}
+        live_room = rooms.get(mode.slot)
+        if live_room is None or (100.0 - live_room) < settings.threshold:
+            return
+
+        # Spent, so a move is now on the table and the peers' rows decide it.
+        # Measure them before ranking: each one was last read when it was last
+        # live, which for the account this is about to choose may be days ago.
+        ranked = self._codex_headroom({slot for _room, slot, _email in ranked})
+        rooms = {slot: room for room, slot, _email in ranked}
+        live_room = rooms.get(mode.slot)
+        if live_room is None or (100.0 - live_room) < settings.threshold:
+            return  # the fresh reading disagrees; nothing to do
+
+        # Same floor as the backend's return line, for the same reason: the
+        # two settings are validated apart and their ranges overlap, so the
+        # difference reaches zero and no utilization could ever be under it.
+        return_below = max(
+            settings.threshold - settings.hysteresis_pct, MIN_RETURN_PCT
+        )
+        target = next(
+            (
+                (room, slot, email)
+                for room, slot, email in ranked
+                if slot != mode.slot
+                and room is not None
+                and (100.0 - room) < return_below
+            ),
+            None,
+        )
+        if target is None:
+            self._warn_rotation(
+                "the Codex account serving the router is exhausted and no "
+                "Codex account has headroom to take over"
+            )
+            return
+
+        if self._backend_in_cooldown(state):
+            return
+
+        room, slot, email = target
+        leaving = _ref(mode.slot, self.switcher.account_email(mode.slot))
+        reason = f"{pct_label(100.0 - live_room)} used"
+        if self.dry_run:
+            self._emit(
+                CodexRotateEvent(
+                    leaving=leaving,
+                    account=_ref(slot, email),
+                    reason=reason,
+                    dry_run=True,
+                )
+            )
+            return
+
+        # activate_codex takes the leaving account's rotated token back before
+        # it overwrites the credential file. Skipping that kills the login.
+        ok, message = switching.activate_codex(
+            self.switcher, slot, email, pinned=False
+        )
+        if not ok:
+            self._warn_rotation(f"could not rotate the Codex account: {message}")
+            return
+        self._note_backend_flip()
+        self._rotation_warned = False
+        if message:
+            self._emit(ConfigWarningEvent(message=message))
+        self._emit(
+            CodexRotateEvent(
+                leaving=leaving, account=_ref(slot, email), reason=reason
+            )
+        )
+
     def _warn_fallback(self, message: str) -> None:
         """Emit a fallback warning once, not on every tick."""
         if self._fallback_warned:
             return
         self._fallback_warned = True
+        self._emit(ConfigWarningEvent(message=message))
+
+    def _warn_rotation(self, message: str) -> None:
+        """Emit a Codex rotation warning once, not on every tick."""
+        if self._rotation_warned:
+            return
+        self._rotation_warned = True
         self._emit(ConfigWarningEvent(message=message))
 
     def _backend_in_cooldown(self, state: dict) -> bool:
