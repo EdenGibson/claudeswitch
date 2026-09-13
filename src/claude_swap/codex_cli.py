@@ -41,6 +41,8 @@ providers in one pool.
   cswap codex add                ->  cswap add --provider codex
   cswap codex switch <num|email> ->  cswap switch <num|email>
   cswap codex remove <num|email> ->  cswap remove <num|email>
+  cswap codex live status        ->  show live account acknowledgments
+  cswap codex live sync          ->  apply the selected account to live servers
 
 list and status show every account, Claude ones included.
 """
@@ -80,6 +82,12 @@ def translate(argv: list[str]) -> list[str]:
 def codex_command(argv: list[str]) -> None:
     """Entry point for ``cswap codex``: rewrite, then run the main command."""
     from claude_swap.cli import main
+
+    if argv and argv[0] == 'live':
+        from claude_swap.codex_live import command
+
+        command(argv[1:])
+        return
 
     sys.argv = [sys.argv[0], *translate(argv)]
     main()

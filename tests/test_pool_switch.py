@@ -80,6 +80,28 @@ def test_json_output_names_the_provider(pool):
     assert result["provider"] == "codex"
 
 
+def test_switch_reports_live_failures_without_undoing_file_switch(pool, monkeypatch):
+    report = {'updated': 1, 'failed': [{'pid': 20, 'status': 'failed'}],
+              'unsupported': [], 'warnings': ['One server rejected the account']}
+    monkeypatch.setattr('claude_swap.codex_live.sync_live', lambda: report)
+    result = pool.switch_to('3', json_output=True)
+    assert _live_account_id() == B_ID
+    assert result['liveSessions'] == report
+    assert result['warnings'] == report['warnings']
+
+
+def test_switch_to_selected_account_still_syncs_live_servers(pool, monkeypatch):
+    calls = []
+
+    def sync():
+        calls.append(_live_account_id())
+        return {'updated': 1, 'failed': [], 'unsupported': [], 'warnings': []}
+
+    monkeypatch.setattr('claude_swap.codex_live.sync_live', sync)
+    pool.switch_to('2')
+    assert calls == [A_ID]
+
+
 def test_a_codex_slot_with_no_stored_credential_errors(pool):
     CodexAccountStore().delete_credential("3", B_EMAIL)
     with pytest.raises(ConfigError, match="No stored credential"):

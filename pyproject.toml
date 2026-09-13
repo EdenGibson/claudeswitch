@@ -12,6 +12,7 @@ dependencies = [
     "keyring>=25.0.0; sys_platform == 'win32'",
     "textual>=8.2.8,<9",
     "truststore>=0.10.4",
+    "websockets>=15,<18",
 ]
 authors = [{name = "Onur Cetinkol", email = "onurcetinkol@gmail.com"}]
 license = {text = "MIT"}

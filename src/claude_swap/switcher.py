@@ -5017,13 +5017,13 @@ class ClaudeAccountSwitcher:
     ) -> dict | None:
         """Make a non-Claude slot live. Leaves every other provider alone.
 
-        Switching Codex writes ``~/.codex/auth.json`` only. Claude Code keeps
-        reading its own credential, so the Claude active account is unchanged.
+        Codex listeners follow the new login through a persistent auth client.
         """
         if provider != "codex":
             raise ConfigError(f"Cannot switch a {provider} account")
 
         from claude_swap.codex_store import CodexAccountStore
+        from claude_swap.codex_live import sync_live
 
         data = self._get_sequence_data() or {}
         account = data.get("accounts", {}).get(str(account_num), {})
@@ -5034,16 +5034,24 @@ class ClaudeAccountSwitcher:
         # live, the recapture stores the fresh blob and the read gives back
         # those same bytes. Reading first would write a stale copy over a
         # rotated single-use refresh token, spending the user's login.
-        self._recapture_provider_live(provider, data)
-        blob = store.read_credential(str(account_num), email)
-        if not blob:
-            raise ConfigError(
-                f"No stored credential for Account-{account_num} ({email}). "
-                f"Re-add it with 'cswap add --provider {provider}'."
-            )
-        store.write_live(blob)
-        self._record_provider_active(provider, str(account_num))
+        with store._lock(), FileLock(self.lock_file):
+            data = self._get_sequence_data() or {}
+            account = data.get('accounts', {}).get(str(account_num), {})
+            if account.get('provider') != provider or account.get('email') != email:
+                raise ConfigError('Account changed during the switch; retry')
+            self._recapture_provider_live(provider, data)
+            blob = store.read_credential(str(account_num), email)
+            if not blob:
+                raise ConfigError(
+                    f"No stored credential for Account-{account_num} ({email}). "
+                    f"Re-add it with 'cswap add --provider {provider}'."
+                )
+            store.write_live(blob)
+            data.setdefault('activeProviderAccounts', {})[provider] = str(account_num)
+            self._write_json(self.sequence_file, data)
         note = router_switching.follow_switch(self, provider, str(account_num))
+        live = sync_live()
+        notes = ([note] if note else []) + live['warnings']
 
         if json_output:
             return {
@@ -5052,10 +5060,13 @@ class ClaudeAccountSwitcher:
                 "provider": provider,
                 "to": account_ref(int(account_num), email),
                 "strategy": "direct",
-                "warnings": [note] if note else [],
+                "warnings": notes,
+                "liveSessions": live,
             }
         print(f"{accent('Switched to')} Account-{account_num} ({email}) [{provider}]")
-        if note:
+        if live['updated']:
+            print(f"  Updated {live['updated']} live Codex servers; no restart")
+        for note in notes:
             print(f"  {dimmed(note)}")
         return None
 

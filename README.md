@@ -229,8 +229,32 @@ cswap export backup.cswap       # Carries Codex accounts too
 codex`, and `cswap codex list` is `cswap list`.
 
 **Each provider has its own active account.** Switching to a Codex slot writes
-`~/.codex/auth.json` and nothing else, so your Claude login keeps working. `cswap status` shows
-both.
+`~/.codex/auth.json`. Your Claude login stays active. `cswap status` shows both.
+
+**Existing Codex servers can switch without a restart.** On Linux with a systemd
+user session, `cswap switch` also updates local Codex app servers through their Unix
+sockets. The command reports how many servers confirmed the account. A response
+already in progress can finish on its original account; subsequent turns use the
+selected account. The integration never stops a process or interrupts a turn.
+
+The auth helper stays connected after the switch command exits. It answers Codex's
+token-refresh requests and saves rotated credentials. systemd restarts the helper
+after a crash. The helper follows changes to the shared login file and exits when
+no supported servers remain. Each private `CODEX_HOME`, such as a `cswap run`
+session, keeps its own account. Explicit API-key and access-token overrides are
+excluded.
+
+```bash
+cswap codex live status          # latest per-server acknowledgments and their age
+cswap codex live sync            # retry the selected account without another file switch
+```
+
+Live account replacement uses Codex's experimental `chatgptAuthTokens` API.
+Standalone terminals, stdio/TCP listeners, and other operating systems do not yet
+support this integration. Unsupported processes and rejected updates produce
+warnings. The saved account stays selected when a live update fails; JSON switch
+output includes a `liveSessions` report. Repeating the switch retries live updates,
+even when the saved account already matches.
 
 **Account rotation never crosses providers.** `cswap auto` and bare `cswap switch` rotate Claude
 accounts only. Pick a Codex account by naming it. Moving the *backend* between providers is a
