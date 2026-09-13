@@ -410,7 +410,15 @@ class SessionManager:
         share: bool = True,
         share_history: bool = False,
     ) -> NoReturn:
-        """Launch Claude Code as the given account in the current terminal."""
+        """Launch the account's own CLI in the current terminal."""
+        # Resolve first: a Codex slot launches codex, so a box with no claude
+        # on PATH must still be able to run one.
+        account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        if self.switcher.provider_of(account_num) != "claude":
+            self._run_other_provider(
+                account_num, email, claude_args, share, share_history
+            )
+
         claude_bin = shutil.which("claude")
         if not claude_bin:
             raise SessionError(
@@ -423,7 +431,6 @@ class SessionManager:
                 "of sharing it."
             )
 
-        account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
@@ -488,6 +495,40 @@ class SessionManager:
                 "'claude' was not found on PATH. Install Claude Code first."
             )
         self._exec(claude_bin, claude_args, env=dict(os.environ))
+
+    def _run_other_provider(
+        self,
+        account_num: str,
+        email: str,
+        cli_args: list[str],
+        share: bool,
+        share_history: bool,
+    ) -> NoReturn:
+        """Launch a non-Claude account with its own CLI. Never returns.
+
+        Codex reads CODEX_HOME the way Claude Code reads CLAUDE_CONFIG_DIR, so
+        session mode carries over. The sharing flags describe the Claude
+        session profile only, so a flag that would silently do nothing is
+        rejected instead.
+        """
+        provider = self.switcher.provider_of(account_num)
+        if provider != "codex":
+            raise SessionError(
+                f"'cswap run' cannot launch a {provider} account yet"
+            )
+        if share_history or not share:
+            raise SessionError(
+                "--share-history and --no-share describe the Claude session "
+                f"profile; Account-{account_num} is a codex account"
+            )
+
+        from claude_swap import codex_session
+
+        print(
+            f"{accent('Launching')} Account-{account_num} ({email}) "
+            f"{muted('[codex session]')}"
+        )
+        sys.exit(codex_session.run(account_num, email, cli_args))
 
     def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
         """Hand the terminal over to claude. Never returns.

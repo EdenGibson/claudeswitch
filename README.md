@@ -110,6 +110,15 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 */5 * * * * cswap auto --once --json >> ~/.cswap-auto.log 2>&1
 ```
 
+- **When every Claude account is spent, it can move to Codex instead of waiting.** Off by default; turn it on with `cswap config set autoswitch.fallbackProvider codex`. It needs the [router](#router-change-backend-without-restarting-a-session) installed and at least one Codex account in the pool, and it says so once if either is missing. See the router section for the terms-of-service warning that comes with it.
+  - It flips only when every Claude account is **measured** and every one has reached `autoswitch.threshold` — the same line rotation uses, not zero headroom. An account at 97% used is one rotation would never land on, so counting its last 3 points as a reason to stay would hold the backend on accounts the engine has already given up on. One unreadable account is enough to hold the flip back: moving every session to another provider on a guess is worse than waiting.
+  - It returns to Claude once an account recovers past `threshold - autoswitch.hysteresisPct` — 10 points better than the line it left on, by default. Between the two lines nothing moves, so an account grazing the threshold cannot drag every session back and forth. It takes the backend's refreshed Codex token back into cswap's store on the way.
+  - **It rotates between Codex accounts too, once it is on one.** Through a long Claude outage that first Codex account carries every session until it reaches its own limit, so at `threshold` the engine moves to the Codex account with the most headroom, on the same two lines. An unmeasured account is never called spent and never chosen as a target. With every Codex account over the line it stays put and says so once. Returning to Claude outranks rotating, and while the router serves a Codex account the engine polls it on the normal cadence — nothing else in its schedule does.
+  - The cooldown governs both directions too, so a flip is delayed as well as damped. A rotation between Codex accounts is the same class of move and takes the same cooldown.
+  - `cswap backend claude` or `cswap backend codex` pins the backend and the engine stops touching it. `cswap backend auto` hands it back.
+  - The flip is logged loudly, and `cswap status` grows a `Backend:` line, because Claude Code's own UI keeps naming a Claude model while a GPT model answers.
+  - `cswap auto --dry-run` reports the decision and the missing parts without moving anything.
+
 Defaults like the threshold and cooldown are configurable with `cswap config set autoswitch.threshold 80` — flags override them (see [Configuration](#configuration)).
 
 </details>
@@ -197,6 +206,142 @@ cswap purge                     # Remove all claude-swap data
 
 The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working.
 
+### Codex accounts
+
+`cswap` also manages OpenAI Codex (ChatGPT subscription) accounts. They share one pool with the
+Claude accounts: one slot list, one `cswap list`, one `cswap switch`. Only the credential lives
+apart, under `<backup directory>/providers/codex/`, because the Codex CLI reads
+`~/.codex/auth.json` and Claude Code reads its own file.
+
+```bash
+codex login                     # Log in as the account you want to add
+cswap add --provider codex      # Capture it into the next free slot
+cswap list                      # Every account; Codex rows are tagged (codex)
+cswap switch 9                  # Make slot 9 the live ~/.codex/auth.json
+cswap switch a@work.com         # Accounts resolve by email too
+cswap status                    # Active account, per provider
+cswap run 9                     # Launch codex as slot 9, this terminal only
+cswap remove 9                  # Forget it (leaves your current login alone)
+cswap export backup.cswap       # Carries Codex accounts too
+```
+
+`cswap codex <command>` still works as an alias — `cswap codex add` is `cswap add --provider
+codex`, and `cswap codex list` is `cswap list`.
+
+**Each provider has its own active account.** Switching to a Codex slot writes
+`~/.codex/auth.json`. Your Claude login stays active. `cswap status` shows both.
+
+**Existing Codex servers can switch without a restart.** On Linux with a systemd
+user session, `cswap switch` also updates local Codex app servers through their Unix
+sockets. The command reports how many servers confirmed the account. A response
+already in progress can finish on its original account; subsequent turns use the
+selected account. The integration never stops a process or interrupts a turn.
+
+The auth helper stays connected after the switch command exits. It answers Codex's
+token-refresh requests and saves rotated credentials. systemd restarts the helper
+after a crash. The helper follows changes to the shared login file and exits when
+no supported servers remain. Each private `CODEX_HOME`, such as a `cswap run`
+session, keeps its own account. Explicit API-key and access-token overrides are
+excluded.
+
+```bash
+cswap codex live status          # latest per-server acknowledgments and their age
+cswap codex live sync            # retry the selected account without another file switch
+```
+
+Live account replacement uses Codex's experimental `chatgptAuthTokens` API.
+Standalone terminals, stdio/TCP listeners, and other operating systems do not yet
+support this integration. Unsupported processes and rejected updates produce
+warnings. The saved account stays selected when a live update fails; JSON switch
+output includes a `liveSessions` report. Repeating the switch retries live updates,
+even when the saved account already matches.
+
+**Account rotation never crosses providers.** `cswap auto` and bare `cswap switch` rotate Claude
+accounts only. Pick a Codex account by naming it. Moving the *backend* between providers is a
+separate decision, made by `cswap backend` or by
+[`autoswitch.fallbackProvider`](#automatic-switching).
+
+One case does rotate a Codex account automatically: `cswap auto` with
+[`autoswitch.fallbackProvider codex`](#automatic-switching), once it has already moved the router
+onto Codex and that account reaches its own limit. It stays inside the Codex accounts, and it only
+ever touches the account the router is serving.
+
+Quota comes from the same rate-limit windows the Codex CLI itself reports, so the 5-hour and
+weekly percentages line up with what `/status` shows inside Codex. A plan that reports no 5-hour
+window simply shows the weekly one.
+
+Switching saves the live credential back to its own slot first, because the Codex CLI refreshes
+tokens in place and OpenAI refresh tokens are single-use. Losing that write would eventually force
+a browser re-login. `cswap run` on a Codex slot does the same on exit, which is why it stays
+resident instead of handing the terminal over.
+
+Not yet supported for Codex accounts: aliases, directory mappings, and macOS Keychain storage
+(Codex credentials use the file backend on every platform).
+
+**Downgrading is not safe once you hold a Codex account.** An older `cswap` knows only Claude, so
+it reads a Codex slot as a broken Claude account. Remove your Codex accounts before you install an
+older version. An export made here also refuses to import into an older `cswap`, by design: it
+aborts the whole import rather than restore a Codex credential as a Claude one.
+
+### Router: change backend without restarting a session
+
+A Codex account normally serves the `codex` CLI, not Claude Code. The router changes that. It
+answers on `http://127.0.0.1:8318`, and Claude Code is pointed at that address instead of
+`api.anthropic.com`. Which backend stands behind the address is then a one-line file, and a
+session already running follows it on its next request.
+
+```bash
+cswap router install     # point Claude Code at the router, install the services
+cswap backend codex      # every session behind the router moves to Codex
+cswap backend codex 9    # ...on account 9 specifically
+cswap backend claude     # back to Anthropic
+cswap router status      # what is installed, what is running, which backend
+cswap router uninstall   # put settings.json back exactly as it was
+```
+
+**Read this before you install it.**
+
+- **Both providers' terms forbid it.** Anthropic does not support Claude Code against a
+  third-party gateway, and OpenAI's terms do not allow a ChatGPT subscription to serve another
+  client. Accounts have been banned for this. It is your decision.
+- **Only sessions started after `cswap router install` can follow a switch.** Claude Code reads
+  `ANTHROPIC_BASE_URL` once, when the process starts. Sessions running now keep talking straight
+  to Anthropic until you restart them, once.
+- **It needs CLIProxyAPI** for the Codex side — cswap supplies the config and the credential and
+  starts the process, but the Anthropic-to-Codex translation is
+  [CLIProxyAPI's](https://github.com/router-for-me/CLIProxyAPI). Claude mode needs nothing extra.
+- **Install the router extra**: `pip install cswap[router]`, or add `--with aiohttp` to your
+  `uv tool install`.
+- **Remote Control and the claude.ai session viewer stop working** while the base URL is not
+  Anthropic's. Your saved login and voice dictation are untouched: the router writes one settings
+  key and no credential variable.
+
+Claude mode is a plain passthrough. The request reaches `api.anthropic.com` with its own
+`Authorization` header, so cswap's account switching works exactly as before.
+
+Codex mode never falls back to Anthropic. An unreachable backend is a 503 — silently spending the
+Claude quota you switched away from would defeat the point.
+
+The model name is rewritten on the way out: a Haiku request goes to the small Codex model,
+everything else to the main one. The two names live in `router/models.json`, and the router
+corrects them against whatever the backend says it can serve.
+
+Switching Codex accounts follows the router. `cswap switch 9` republishes slot 9's credential
+when the router is already in codex mode. It never turns the router on by itself.
+
+`cswap backend claude` takes the backend's refreshed token back into cswap's own store.
+CLIProxyAPI rotates the credential while it serves, and an OpenAI refresh token is single-use.
+
+**Automatic fallback.** With `cswap config set autoswitch.fallbackProvider codex`, `cswap auto`
+moves the backend to Codex once every Claude account is spent, and back again when one recovers.
+It also rotates between Codex accounts while it is on one, so a long outage is not capped by the
+first Codex account's own weekly window. See [Automatic switching](#automatic-switching) for the
+exact conditions.
+
+While CLIProxyAPI serves a Codex account it owns that token family, so cswap reads the backend's
+rotation rather than taking its own. A usage poll of the account being served will never refresh
+its token: the refresh is single-use, and taking it would retire the copy the backend still holds.
+
 ## Tips
 
 - **Do you need to restart after switching?** Usually not. On **Linux and Windows**, credentials are stored in a file and Claude Code re-reads them whenever that file changes, so the new account takes effect on your next message — no restart needed. On **macOS**, credentials live in the Keychain, which Claude Code caches for about 30 seconds; a running session picks up the switch once that cache expires. Restart Claude Code (or close and reopen the VS Code extension tab) only if you want the change to apply instantly.
@@ -220,6 +365,10 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 | Windows | File-based (inside the backup directory, under `credentials/`) | `~/.claude-swap-backup/` |
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
+
+Codex credentials live under the backup directory in `providers/codex/credentials/`, and
+`cswap run` profiles for Codex in `providers/codex/sessions/`. The accounts themselves are in
+the main `sequence.json`, alongside the Claude ones.
 
 Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
 
@@ -315,7 +464,7 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 
 </details>
 
-`cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
+`cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `backend-switched`, `codex-rotated`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
 
 ### Add an account from a raw token or API key
 

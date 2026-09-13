@@ -80,7 +80,8 @@ from claude_swap.paths import (
     migrate_legacy_backup_dir,
 )
 from claude_swap.process_detection import get_running_instances
-from claude_swap import poll_policy
+from claude_swap.router import switching as router_switching
+from claude_swap import poll_policy, provider_ops
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
     FetchRecord,
@@ -685,6 +686,15 @@ class ClaudeAccountSwitcher:
         if not record:
             return False
         email = record.get("email", "")
+        provider = record.get("provider") or "claude"
+        if provider != "claude":
+            # A non-Claude slot has no Claude config backup and never needs
+            # one. A stored credential is the whole requirement.
+            return bool(
+                self._read_provider_credentials(
+                    provider, str(account_num), email, is_active=False
+                )
+            )
         if not self._read_account_credentials(str(account_num), email):
             return False
         if not self._read_account_config(str(account_num), email):
@@ -882,6 +892,10 @@ class ClaudeAccountSwitcher:
         creds_b = self._read_account_credentials(num_b, email_b)
         config_a = self._read_account_config(num_a, email_a)
         config_b = self._read_account_config(num_b, email_b)
+        # A non-Claude slot keeps one credential file under the same key, so
+        # it has to follow the account to its new number.
+        prov_a = self._read_provider_material(num_a, email_a)
+        prov_b = self._read_provider_material(num_b, email_b)
 
         staging: dict[str, Path] = {}
         try:
@@ -923,6 +937,8 @@ class ClaudeAccountSwitcher:
                 self._write_account_config(num_a, email_b, config_b)
             else:
                 self._delete_config_backup(num_a, email_b)
+            self._put_provider_material(num_b, email_a, prov_a)
+            self._put_provider_material(num_a, email_b, prov_b)
 
             data["accounts"][num_a], data["accounts"][num_b] = record_b, record_a
             int_a, int_b = int(num_a), int(num_b)
@@ -939,6 +955,7 @@ class ClaudeAccountSwitcher:
                 data["activeAccountNumber"] = int_b
             elif active == int_b:
                 data["activeAccountNumber"] = int_a
+            self._renumber_provider_active(data, {num_a: num_b, num_b: num_a})
             data["lastUpdated"] = get_timestamp()
             # The commit point: _write_json's rename publishes the swap.
             self._write_json(self.sequence_file, data)
@@ -948,7 +965,18 @@ class ClaudeAccountSwitcher:
                 num_b, email_b, creds_b, config_b,
                 staging,
             )
+            try:
+                self._put_provider_material(num_a, email_a, prov_a)
+                self._put_provider_material(num_b, email_b, prov_b)
+            except OSError as e:
+                self._logger.error(f"Provider credential restore failed: {e}")
             raise
+
+        # The router files its backend by slot number, so it has to be told
+        # too. Out here, not inside the try: the write above is the commit
+        # point, and anything after it under `except BaseException` would let
+        # a Ctrl-C roll both credentials back to a swap already published.
+        router_switching.follow_renumber({num_a: num_b, num_b: num_a})
 
         # Post-commit cleanup, all best-effort: the records already reference
         # the new keys only. A failure here leaks a stale file, never a wrong
@@ -957,6 +985,7 @@ class ClaudeAccountSwitcher:
         if email_a != email_b:
             for num, email in ((num_a, email_a), (num_b, email_b)):
                 try:
+                    self._put_provider_material(num, email, "")
                     self._delete_account_files(num, email)
                 except Exception as e:
                     self._logger.error(
@@ -976,6 +1005,46 @@ class ClaudeAccountSwitcher:
             f"Swapped slots: {num_a} ({email_a}) <-> {num_b} ({email_b})"
         )
         return num_a, num_b
+
+    def _read_provider_material(self, account_num: str, email: str) -> str:
+        """Stored non-Claude credential for one slot key, or "" when there is none.
+
+        Codex is the only non-Claude backend, and a Claude slot never has one
+        of its files, so this needs no provider argument: the key either holds
+        a provider credential or it does not.
+        """
+        from claude_swap.codex_store import CodexAccountStore
+
+        return CodexAccountStore().read_credential(account_num, email)
+
+    def _put_provider_material(
+        self, account_num: str, email: str, blob: str
+    ) -> None:
+        """Set one slot key's non-Claude credential to exactly ``blob``.
+
+        An empty blob clears the key. Clearing matters on a same-email swap,
+        where the destination key is also a source key and would otherwise
+        keep serving the other account's credential.
+        """
+        from claude_swap.codex_store import CodexAccountStore
+
+        store = CodexAccountStore()
+        if blob:
+            store.write_credential(account_num, email, blob)
+        else:
+            store.delete_credential(account_num, email)
+
+    def _renumber_provider_active(
+        self, data: dict, moves: dict[str, str]
+    ) -> None:
+        """Follow ``activeProviderAccounts`` across a swap or a move."""
+        active = data.get("activeProviderAccounts")
+        if not active:
+            return
+        for provider, slot in list(active.items()):
+            new = moves.get(str(slot))
+            if new is not None:
+                active[provider] = new
 
     def _delete_config_backup(self, account_num: str, email: str) -> None:
         """Delete one slot key's config backup file, if present.
@@ -1294,6 +1363,7 @@ class ClaudeAccountSwitcher:
         # move. Missing material reads as "" (api-key or never-backed-up slot).
         creds = self._read_account_credentials(num_src, email)
         config = self._read_account_config(num_src, email)
+        prov_blob = self._read_provider_material(num_src, email)
 
         src_dir = self._session_dir(num_src, email)
         dst_dir = self._session_dir(target, email)
@@ -1324,6 +1394,7 @@ class ClaudeAccountSwitcher:
                 self._write_account_config(target, email, config)
             else:
                 self._delete_config_backup(target, email)
+            self._put_provider_material(target, email, prov_blob)
 
             data["accounts"][target] = record
             del data["accounts"][num_src]
@@ -1337,6 +1408,7 @@ class ClaudeAccountSwitcher:
             data["sequence"].sort()
             if data.get("activeAccountNumber") == int_src:
                 data["activeAccountNumber"] = int_target
+            self._renumber_provider_active(data, {num_src: target})
             data["lastUpdated"] = get_timestamp()
             # The commit point: _write_json's rename publishes the move.
             self._write_json(self.sequence_file, data)
@@ -1347,11 +1419,18 @@ class ClaudeAccountSwitcher:
             try:
                 self._delete_account_credentials(target, email)
                 self._delete_config_backup(target, email)
+                self._put_provider_material(target, email, "")
                 if dst_dir.exists() and not src_dir.exists():
                     os.replace(dst_dir, src_dir)
             except Exception as e:
                 self._logger.error(f"Cleanup after failed move incomplete: {e}")
             raise
+
+        # The router files its backend by slot number, so it has to be told
+        # too. Out here, not inside the try: the write above is the commit
+        # point, and anything after it under `except BaseException` would let
+        # a Ctrl-C roll the credential back to a move already published.
+        router_switching.follow_renumber({num_src: target})
 
         # Post-commit: clear the old keys, best effort — the records now
         # reference the target slot only. _delete_account_files drops the
@@ -1361,6 +1440,7 @@ class ClaudeAccountSwitcher:
         # (logged loudly: it would poison a future same-email account
         # landing on that slot).
         try:
+            self._put_provider_material(num_src, email, "")
             self._delete_account_files(num_src, email)
         except Exception as e:
             self._logger.error(
@@ -1482,7 +1562,10 @@ class ClaudeAccountSwitcher:
         accounts: list[AccountSnapshot] = []
         for num, email, org_name, org_uuid, is_active, _creds, alias in accounts_info:
             n = str(num)
-            if is_active:
+            provider = self.provider_of(n)
+            # ``active_number`` drives the Claude switch UI, so only a Claude
+            # slot may claim it. A Codex row is still marked active in itself.
+            if is_active and provider == "claude":
                 active_number = n
             accounts.append(
                 AccountSnapshot(
@@ -1496,6 +1579,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    provider=provider,
                 )
             )
         return AccountsSnapshot(
@@ -1560,12 +1644,20 @@ class ClaudeAccountSwitcher:
         disabled (``cswap disable``). Disabled slots stay managed and remain
         valid explicit ``cswap switch <num|email>`` targets — they are only
         held out of automatic rotation and the usage-aware strategies.
+
+        Non-Claude slots are excluded too. Rotation exists to move Claude Code
+        onto a different account, and Claude Code cannot read another
+        provider's credential, so landing on one would leave it unauthenticated
+        rather than switched. Cross-provider rotation needs the router; until
+        then a Codex account is an explicit target only.
         """
         data = self._get_sequence_data() or {}
         return [
             str(num)
             for num in data.get("sequence", [])
-            if self._account_is_switchable(str(num))
+            if (data.get("accounts", {}).get(str(num), {}).get("provider") or "claude")
+            == "claude"
+            and self._account_is_switchable(str(num))
             and not self._disabled_from_data(data, str(num))
         ]
 
@@ -1653,6 +1745,48 @@ class ClaudeAccountSwitcher:
         """Stored email for a slot; empty string when unknown."""
         data = self._get_sequence_data() or {}
         return data.get("accounts", {}).get(str(account_num), {}).get("email", "")
+
+    def provider_of(self, account_num: str | int) -> str:
+        """Which credential backend owns a slot. Unknown slots read as Claude."""
+        cached = getattr(self, "_slot_providers", None)
+        if cached is not None and str(account_num) in cached:
+            return cached[str(account_num)]
+        data = self._get_sequence_data() or {}
+        account = data.get("accounts", {}).get(str(account_num), {})
+        return account.get("provider") or "claude"
+
+    def provider_active_number(self, provider: str) -> str | None:
+        """Slot of ``provider``'s live login, or None when it is unmanaged.
+
+        Claude and Codex read different credential files, so each provider has
+        its own active account. The registry records the Codex one under
+        ``activeProviderAccounts``, but that pointer only nominates a slot —
+        the live blob's own identity decides, because ``codex login`` run
+        outside cswap changes the file without touching the registry.
+        """
+        if provider == "claude":
+            return self.current_account_number()
+        ops = provider_ops.ops_for(provider)
+        live = ops.read_live()
+        if not live:
+            return None
+        identity = ops.identity(live)
+        if identity is None:
+            return None
+        data = self._get_sequence_data() or {}
+        for num, account in data.get("accounts", {}).items():
+            if account.get("provider") != provider:
+                continue
+            if account.get("uuid") == identity.account_uuid:
+                return str(num)
+        return None
+
+    def active_by_provider(self) -> dict[str, str | None]:
+        """The active slot of every provider the pool can hold."""
+        return {
+            name: self.provider_active_number(name)
+            for name in provider_ops.provider_names()
+        }
 
     def current_account_number(self) -> str | None:
         """Slot of the live login; ``None`` when there is none or it's unmanaged.
@@ -2633,6 +2767,96 @@ class ClaudeAccountSwitcher:
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
 
+    def _delete_provider_files(
+        self, provider: str, account_num: str, email: str
+    ) -> None:
+        """Delete a non-Claude slot's stored credential.
+
+        The provider's live credential file is deliberately left alone: this
+        removes cswap's copy, never the user's current login.
+        """
+        if provider != "codex":
+            return
+        from claude_swap.codex_store import CodexAccountStore
+
+        CodexAccountStore().delete_credential(account_num, email)
+
+    def add_provider_account(
+        self, provider: str, slot: int | None = None
+    ) -> tuple[str, str]:
+        """Capture a provider's live credential into a slot. Returns (slot, label).
+
+        Duplicate detection keys on the provider's own account id, not the
+        email: one person can hold two ChatGPT accounts on the same address.
+        """
+        ops = provider_ops.ops_for(provider)
+        live = ops.read_live()
+        if not live:
+            raise ConfigError(
+                f"No {provider} credential at {ops.live_path()}. "
+                f"Run '{ops.binary} login' first."
+            )
+        identity = ops.identity(live)
+        if identity is None:
+            raise ConfigError(
+                f"Could not read a {provider} account from {ops.live_path()}"
+            )
+
+        with FileLock(self.lock_file):
+            data = self._get_sequence_data() or {
+                "sequence": [], "accounts": {}, "activeAccountNumber": None
+            }
+            data.setdefault("accounts", {})
+            data.setdefault("sequence", [])
+            for num, account in data["accounts"].items():
+                if (
+                    account.get("provider") == provider
+                    and account.get("uuid") == identity.account_uuid
+                ):
+                    raise ConfigError(
+                        f"{identity.email} is already managed in Account-{num}"
+                    )
+
+            if slot is not None:
+                target = str(slot)
+                if target in data["accounts"]:
+                    raise ConfigError(f"Account-{target} is already taken")
+            else:
+                taken = {int(n) for n in data["accounts"] if str(n).isdecimal()}
+                candidate = 1
+                while candidate in taken:
+                    candidate += 1
+                target = str(candidate)
+
+            data["accounts"][target] = {
+                "email": identity.email,
+                "uuid": identity.account_uuid,
+                "organizationUuid": identity.org_uuid,
+                "organizationName": identity.org_name,
+                "added": get_timestamp(),
+                "provider": provider,
+                "plan": identity.plan,
+            }
+            if int(target) not in data["sequence"]:
+                data["sequence"].append(int(target))
+                data["sequence"].sort()
+            data.setdefault("activeProviderAccounts", {})[provider] = target
+            data["lastUpdated"] = get_timestamp()
+            self._write_provider_credential(provider, target, identity.email, live)
+            self._write_json(self.sequence_file, data)
+
+        return target, identity.display_label
+
+    def _write_provider_credential(
+        self, provider: str, account_num: str, email: str, blob: str
+    ) -> None:
+        """Store a non-Claude slot's credential in its own backend."""
+        if provider != "codex":
+            raise ConfigError(f"Cannot store a {provider} credential")
+        from claude_swap.codex_store import CodexAccountStore
+
+        CodexAccountStore().write_credential(account_num, email, blob)
+
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
 
@@ -2707,7 +2931,19 @@ class ClaudeAccountSwitcher:
                 return
 
         # Remove backup files
-        self._delete_account_files(account_num, email)
+        detached = ""
+        provider = account_info.get("provider") or "claude"
+        if provider == "claude":
+            self._delete_account_files(account_num, email)
+        else:
+            # Before the credential goes, not after: the router may be serving
+            # this very slot, and the rotated token it holds has nowhere to
+            # come back to once the stored copy is deleted.
+            detached = router_switching.detach_from(self, account_num)
+            self._delete_provider_files(provider, account_num, email)
+            active_map = data.get("activeProviderAccounts") or {}
+            if str(active_map.get(provider)) == account_num:
+                active_map.pop(provider, None)
 
         # Update sequence.json
         del data["accounts"][account_num]
@@ -2717,6 +2953,9 @@ class ClaudeAccountSwitcher:
         self._write_json(self.sequence_file, data)
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
+        if detached:
+            # Under the headline it belongs to, like every other detail line.
+            print(f"  {dimmed(detached)}")
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
 
@@ -2725,8 +2964,15 @@ class ClaudeAccountSwitcher:
 
         Shared by list_accounts and the usage-aware switch helpers so the active
         slot is detected and credentials are read in exactly one place. The
-        active account's credentials come from Claude Code's live store; every
+        active account's credentials come from its provider's live store; every
         other slot reads its backup copy.
+
+        The tuple shape is upstream's. Each slot's provider is recorded in
+        ``self._slot_providers`` instead of a widened tuple, so no consumer or
+        test that unpacks seven elements has to change.
+
+        Each provider has its own active slot, because Claude Code and the
+        Codex CLI read different credential files.
         """
         data = self._get_sequence_data_migrated() or {}
         current_identity = self._get_current_account()
@@ -2736,8 +2982,13 @@ class ClaudeAccountSwitcher:
         if current_identity is not None:
             current_email, current_org_uuid = current_identity
             active_num = self._find_account_slot(data, current_email, current_org_uuid)
+        active_for: dict[str, str | None] = {"claude": active_num}
 
         accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
+        self._slot_providers = {
+            str(n): (a.get("provider") or "claude")
+            for n, a in data.get("accounts", {}).items()
+        }
         # Reset each build; set below only when the active slot's OAuth Keychain
         # read failed with no fallback. Read by _static_usage_sentinel (main
         # thread writes it here before the fetch pool starts → no data race).
@@ -2748,9 +2999,18 @@ class ClaudeAccountSwitcher:
             org_name = account.get("organizationName", "") or ""
             org_uuid = account.get("organizationUuid", "") or ""
             alias = account.get("alias", "") or ""
-            is_active = str(num) == active_num
+            provider = account.get("provider") or "claude"
+            if provider not in active_for:
+                # Resolved once per provider, not once per slot: the Codex
+                # lookup reads and decodes the live credential.
+                active_for[provider] = self.provider_active_number(provider)
+            is_active = str(num) == active_for.get(provider)
 
-            if is_active:
+            if provider != "claude":
+                creds = self._read_provider_credentials(
+                    provider, str(num), email, is_active=is_active
+                )
+            elif is_active:
                 active = self._read_active_credentials()
                 creds = active.value or ""
                 self._active_keychain_unavailable = active.keychain_unavailable
@@ -2759,6 +3019,26 @@ class ClaudeAccountSwitcher:
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
+
+    def _read_provider_credentials(
+        self, provider: str, account_num: str, email: str, *, is_active: bool
+    ) -> str:
+        """A non-Claude slot's credential: the live file when it owns it.
+
+        Reading the live file for the active slot matters for Codex, whose CLI
+        rotates the token in place. The stored copy goes stale the moment the
+        Codex CLI refreshes, and OpenAI refresh tokens are single use, so a
+        stale copy is not merely old — it is spent.
+        """
+        if is_active:
+            live = provider_ops.ops_for(provider).read_live()
+            if live:
+                return live
+        if provider == "codex":
+            from claude_swap.codex_store import CodexAccountStore
+
+            return CodexAccountStore().read_credential(account_num, email)
+        return ""
 
     def _fetch_active_usage(
         self, account_num: str, email: str, creds: str, org_uuid: str = ""
@@ -3368,6 +3648,11 @@ class ClaudeAccountSwitcher:
         outlive the condition that produced it.
         """
         num, email, _, _, is_active, creds, _alias = account_info
+        if self.provider_of(num) != "claude":
+            # A non-Claude blob carries no claudeAiOauth key, so every check
+            # below would read it as credential-less. Its own fetch path
+            # decides instead.
+            return None if creds else USAGE_NO_CREDENTIALS
         if looks_like_api_key(creds):
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
@@ -3383,11 +3668,80 @@ class ClaudeAccountSwitcher:
         # persist) — states that genuinely need the autoswitch ladder.
         return None
 
+    def _fetch_provider_usage(
+        self, provider: str, account_num: str, email: str, creds: str
+    ) -> FetchRecord:
+        """One usage fetch for a non-Claude slot. Never raises.
+
+        Refreshes an expired token first and writes the rotated credential to
+        every copy that held the old one. OpenAI refresh tokens are single use,
+        so a refresh that is not written back does not merely waste work — it
+        leaves the other copy holding a token the server now rejects with
+        ``refresh_token_reused``, which forces a browser re-login.
+
+        One slot is exempt from that refresh: the Codex account CLIProxyAPI is
+        serving. The backend refreshes that family itself every 15 minutes and
+        holds its own copy, so a refresh taken here retires the token the
+        backend still has, and the backend's next refresh kills the login. A
+        usage reading must not be able to do that. Instead the backend's own
+        rotation is read back first, and an expired token is reported rather
+        than refreshed — the backend renews it on its own cadence, and the
+        next poll sees the new one.
+        """
+        if not creds:
+            return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
+        if provider != "codex":
+            return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
+
+        from claude_swap.codex_store import CodexAccountStore
+        from claude_swap.providers import codex
+        from claude_swap.router import switching as router_switching
+
+        store = CodexAccountStore()
+        blob = creds
+        if router_switching.router_serves(str(account_num)):
+            if router_switching.sync_back(self, str(account_num)):
+                blob = self._read_provider_material(str(account_num), email) or blob
+            if codex.is_expired(blob):
+                return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+        elif codex.is_expired(blob):
+            refreshed = codex.try_refresh(blob)
+            if refreshed.error is not None:
+                if refreshed.error in ("invalid_grant", "no_refresh_token"):
+                    return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+                return FetchRecord(error=refreshed.error)
+            blob = refreshed.credentials
+            store.write_credential(account_num, email, blob)
+            # The live file is a second holder of the same single-use token.
+            # Guarded by identity, so a login made outside cswap is not
+            # overwritten with another account's credential.
+            live = store.read_live()
+            if live:
+                live_identity = codex.identity(live)
+                new_identity = codex.identity(blob)
+                if (
+                    live_identity is not None
+                    and new_identity is not None
+                    and live_identity.account_uuid == new_identity.account_uuid
+                ):
+                    store.write_live(blob)
+
+        try:
+            usage = codex.fetch_usage(blob)
+        except Exception as exc:  # noqa: BLE001 - classified just below
+            kind, retry_after = oauth._classify_usage_error(exc)
+            return FetchRecord(error=kind, retry_after_s=retry_after)
+        return FetchRecord(usage=usage)
+
     def _fetch_account_usage(
         self, account_info: tuple[int, str, str, str, bool, str, str]
     ) -> FetchRecord:
         """One network fetch for one account. Never raises."""
         num, email, _, org_uuid, is_active, creds, _alias = account_info
+
+        provider = self.provider_of(num)
+        if provider != "claude":
+            return self._fetch_provider_usage(provider, str(num), email, creds)
 
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
@@ -3882,7 +4236,7 @@ class ClaudeAccountSwitcher:
         accounts = []
         seq_data = self._get_sequence_data() or {}
         for num, email, org_name, org_uuid, is_active, _, alias in accounts_info:
-            if is_active:
+            if is_active and self.provider_of(num) == "claude":
                 active_num = num
             entry = entries[str(num)]
             # JSON carries the decision-grade value: last-good only while it is
@@ -3898,6 +4252,7 @@ class ClaudeAccountSwitcher:
                     last_good_usage=entry.last_good,
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
+                    provider=self.provider_of(num),
                 )
             )
         payload = {
@@ -3905,6 +4260,15 @@ class ClaudeAccountSwitcher:
             "activeAccountNumber": active_num,
             "accounts": accounts,
         }
+        # Each provider has its own live credential file, so each has its own
+        # active account. Additive and omitted when only Claude is in the pool.
+        other_active = {
+            name: slot
+            for name, slot in self.active_by_provider().items()
+            if name != "claude" and slot is not None
+        }
+        if other_active:
+            payload["activeProviderAccounts"] = other_active
         # Additive fields (absent when clean) — never printed warnings; the
         # JSON contract keeps stdout a single machine-readable object.
         dup_warnings = self._duplicate_account_warnings(accounts_info)
@@ -3958,6 +4322,11 @@ class ClaudeAccountSwitcher:
             tag = self._get_display_tag(email, org_name, org_uuid)
             label = f"{accent(alias)} ({email})" if alias else email
             markers = ""
+            provider = self.provider_of(num)
+            if provider != "claude":
+                # Only a non-Claude row is tagged, so a Claude-only pool prints
+                # exactly what upstream prints.
+                markers += f" {muted(f'({provider})')}"
             if is_active:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
@@ -4083,11 +4452,19 @@ class ClaudeAccountSwitcher:
                     entry.last_good, entry.fetched_at, entry.age_s
                 )
             )
-        return {
+        payload = {
             "schemaVersion": SCHEMA_VERSION,
             "active": active,
             "totalManagedAccounts": len(data.get("accounts", {})),
         }
+        other = {
+            name: int(slot)
+            for name, slot in self.active_by_provider().items()
+            if name != "claude" and slot is not None
+        }
+        if other:
+            payload["activeProviderAccounts"] = other
+        return payload
 
     def status(self, json_output: bool = False) -> dict | None:
         """Display current account status (or return the schema-v1 payload)."""
@@ -4125,7 +4502,46 @@ class ClaudeAccountSwitcher:
                 print(f"  {line}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+        self._print_other_provider_status(data)
+        backend = router_switching.backend_line()
+        if backend:
+            print(backend)
         return None
+
+    def _print_other_provider_status(self, data: dict) -> None:
+        """One line per non-Claude provider that has an active account.
+
+        Nothing prints when the pool holds only Claude accounts, so the
+        upstream output is unchanged for anyone who never adds one.
+        """
+        for name, slot in self.active_by_provider().items():
+            if name == "claude" or slot is None:
+                continue
+            account = data.get("accounts", {}).get(str(slot), {})
+            email = account.get("email", "")
+            org_name = account.get("organizationName", "") or ""
+            org_uuid = account.get("organizationUuid", "") or ""
+            tag = self._get_display_tag(email, org_name, org_uuid)
+            print(
+                f"{bolded(f'{name.capitalize()}:')} {accent(f'Account-{slot}')} "
+                f"({email} {muted(f'[{tag}]')})"
+            )
+            for line in _usage_entry_lines(self._provider_active_usage(name, str(slot))):
+                print(f"  {line}")
+
+    def _provider_active_usage(self, provider: str, slot: str) -> UsageEntry:
+        """Stored usage for a non-Claude slot. Never fetches."""
+        data = self._get_sequence_data() or {}
+        account = data.get("accounts", {}).get(str(slot), {})
+        # Same identity key the collect pass uses, or the stored row does not
+        # match and the account reads as having no measurement at all.
+        identities = {
+            str(slot): (
+                account.get("email", ""),
+                account.get("organizationUuid", "") or "",
+            )
+        }
+        return self._usage_store.entries(identities).get(str(slot), UsageEntry())
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""
@@ -4596,6 +5012,97 @@ class ClaudeAccountSwitcher:
             if json_output else None
         )
 
+    def _switch_to_provider_account(
+        self, provider: str, account_num: str, *, json_output: bool = False
+    ) -> dict | None:
+        """Make a non-Claude slot live. Leaves every other provider alone.
+
+        Codex listeners follow the new login through a persistent auth client.
+        """
+        if provider != "codex":
+            raise ConfigError(f"Cannot switch a {provider} account")
+
+        from claude_swap.codex_store import CodexAccountStore
+        from claude_swap.codex_live import sync_live
+
+        data = self._get_sequence_data() or {}
+        account = data.get("accounts", {}).get(str(account_num), {})
+        email = account.get("email", "")
+        store = CodexAccountStore()
+
+        # Recapture before reading the stored copy. When the target is already
+        # live, the recapture stores the fresh blob and the read gives back
+        # those same bytes. Reading first would write a stale copy over a
+        # rotated single-use refresh token, spending the user's login.
+        with store._lock(), FileLock(self.lock_file):
+            data = self._get_sequence_data() or {}
+            account = data.get('accounts', {}).get(str(account_num), {})
+            if account.get('provider') != provider or account.get('email') != email:
+                raise ConfigError('Account changed during the switch; retry')
+            self._recapture_provider_live(provider, data)
+            blob = store.read_credential(str(account_num), email)
+            if not blob:
+                raise ConfigError(
+                    f"No stored credential for Account-{account_num} ({email}). "
+                    f"Re-add it with 'cswap add --provider {provider}'."
+                )
+            store.write_live(blob)
+            data.setdefault('activeProviderAccounts', {})[provider] = str(account_num)
+            self._write_json(self.sequence_file, data)
+        note = router_switching.follow_switch(self, provider, str(account_num))
+        live = sync_live()
+        notes = ([note] if note else []) + live['warnings']
+
+        if json_output:
+            return {
+                "schemaVersion": SCHEMA_VERSION,
+                "switched": True,
+                "provider": provider,
+                "to": account_ref(int(account_num), email),
+                "strategy": "direct",
+                "warnings": notes,
+                "liveSessions": live,
+            }
+        print(f"{accent('Switched to')} Account-{account_num} ({email}) [{provider}]")
+        if live['updated']:
+            print(f"  Updated {live['updated']} live Codex servers; no restart")
+        for note in notes:
+            print(f"  {dimmed(note)}")
+        return None
+
+    def _recapture_provider_live(self, provider: str, data: dict) -> None:
+        """Save a non-Claude live credential back into the slot that owns it.
+
+        The Codex CLI refreshes its token in place and nothing syncs that back.
+        Without this, switching away discards the rotation and a later switch
+        back restores a token the server has already retired.
+        """
+        if provider != "codex":
+            return
+        from claude_swap.codex_store import CodexAccountStore
+        from claude_swap.providers import codex
+
+        store = CodexAccountStore()
+        live = store.read_live()
+        if not live:
+            return
+        identity = codex.identity(live)
+        if identity is None:
+            return
+        for num, account in data.get("accounts", {}).items():
+            if account.get("provider") != provider:
+                continue
+            if account.get("uuid") == identity.account_uuid:
+                store.write_credential(str(num), account.get("email", ""), live)
+                return
+
+    def _record_provider_active(self, provider: str, account_num: str) -> None:
+        """Point ``activeProviderAccounts`` at a slot, under the registry lock."""
+        with FileLock(self.lock_file):
+            data = self._get_sequence_data() or {}
+            data.setdefault("activeProviderAccounts", {})[provider] = str(account_num)
+            self._write_json(self.sequence_file, data)
+
     def switch_to(
         self, identifier: str, json_output: bool = False, force: bool = False
     ) -> dict | None:
@@ -4653,6 +5160,15 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data()
         if target_account not in data.get("accounts", {}):
             raise AccountNotFoundError(f"Account-{target_account} does not exist")
+
+        provider = self.provider_of(target_account)
+        if provider != "claude":
+            # None of the Claude ceremony below applies: no keychain, no
+            # session profile, no config backup, no rollback record. A Codex
+            # switch is one guarded file write.
+            return self._switch_to_provider_account(
+                provider, target_account, json_output=json_output
+            )
 
         # Short-circuit a no-op before mutating (issue #79). A self-switch
         # would first back up the live credentials into the target slot —
@@ -5666,6 +6182,11 @@ class ClaudeAccountSwitcher:
             removed_items.append(
                 f"Session profiles: {', '.join(d.name for d in session_dirs)}"
             )
+
+        # Before the backup dir, always: see tear_down's docstring.
+        router_removed = router_switching.tear_down(self)
+        if router_removed:
+            removed_items.append(router_removed)
 
         # Remove backup directory
         if self.backup_dir.exists():

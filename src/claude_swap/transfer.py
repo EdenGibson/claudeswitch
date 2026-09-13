@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from claude_swap import __version__
+from claude_swap import __version__, provider_ops
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
     ConfigError,
@@ -160,6 +160,43 @@ def _slim_credentials(creds_obj: dict) -> dict:
     return {"claudeAiOauth": creds_obj["claudeAiOauth"]}
 
 
+def _export_provider_account(
+    switcher: ClaudeAccountSwitcher, provider: str, num: str, record: dict
+) -> dict[str, Any] | None:
+    """One export entry for a non-Claude slot, or None when it has no credential.
+
+    The entry carries no ``config`` key. A non-Claude account has no Claude
+    config to carry, and the absence is also the guard against an older cswap:
+    it requires ``config`` to be an object and aborts the whole import before
+    any write, instead of restoring a Codex blob as a Claude credential.
+
+    The live credential wins for the provider's active slot. Codex rotates its
+    token in place and an OpenAI refresh token is single use, so the stored
+    copy can already be spent.
+    """
+    from claude_swap import provider_ops
+
+    email = record.get("email", "")
+    blob = ""
+    if switcher.provider_active_number(provider) == num:
+        blob = provider_ops.ops_for(provider).read_live() or ""
+    if not blob:
+        blob = switcher._read_provider_material(num, email)
+    if not blob:
+        return None
+
+    return {
+        "number": int(num),
+        "email": email,
+        "uuid": record.get("uuid", ""),
+        "organizationUuid": record.get("organizationUuid", "") or "",
+        "organizationName": record.get("organizationName", "") or "",
+        "added": record.get("added", ""),
+        "provider": provider,
+        "credentials": _parse_payload(blob, f"credentials for {email}"),
+    }
+
+
 def export_accounts(
     switcher: ClaudeAccountSwitcher,
     destination: str,
@@ -208,6 +245,23 @@ def export_accounts(
         record = accounts_map[num]
         email = record.get("email", "")
         org_uuid = record.get("organizationUuid", "") or ""
+
+        provider = switcher.provider_of(num)
+        if provider != "claude":
+            entry = _export_provider_account(switcher, provider, num, record)
+            if entry is None:
+                if explicit_account:
+                    raise CredentialReadError(
+                        f"no stored credential for account {num} ({email})"
+                    )
+                _eprint(
+                    f"Skipping Account-{num} ({email}): no stored "
+                    f"credential — re-add with: "
+                    f"cswap add --provider {provider} --slot {num}"
+                )
+                continue
+            accounts_payload.append(entry)
+            continue
 
         is_active = (
             current_identity is not None
@@ -312,6 +366,25 @@ def export_accounts(
     _eprint(f"Exported {len(accounts_payload)} account(s) to {out_path}")
 
 
+def _find_provider_slot(
+    data: dict, email: str, org_uuid: str, provider: str
+) -> str | None:
+    """The local slot holding this identity for this provider, if any.
+
+    Provider is part of the match. One person can hold a Claude account and a
+    ChatGPT account on one email, and importing either must never overwrite
+    the other.
+    """
+    for num, record in (data.get("accounts") or {}).items():
+        if (record.get("provider") or "claude") != provider:
+            continue
+        if record.get("email") != email:
+            continue
+        if (record.get("organizationUuid") or "") == (org_uuid or ""):
+            return str(num)
+    return None
+
+
 def import_accounts(
     switcher: ClaudeAccountSwitcher,
     source: str,
@@ -379,12 +452,23 @@ def import_accounts(
         email, exported_num = _validate_imported_account(switcher, raw)
         org_uuid = raw.get("organizationUuid", "") or ""
         creds_obj = raw.get("credentials")
+        provider = raw.get("provider") or "claude"
+        if not isinstance(provider, str) or not provider_ops.is_known(provider):
+            raise TransferError(
+                f"unknown provider for {email}: {provider!r}"
+            )
         config_obj = raw.get("config")
-        if not isinstance(config_obj, dict):
+        if provider != "claude":
+            # A non-Claude account has no Claude config, so an absent one is
+            # correct rather than missing.
+            config_obj = config_obj if isinstance(config_obj, dict) else {}
+        elif not isinstance(config_obj, dict):
             raise TransferError(f"config for {email} must be a JSON object")
         # API-key accounts carry the credential as a raw string; OAuth accounts
         # carry a JSON object.
-        is_api_key = raw.get("kind") == "api_key" or isinstance(creds_obj, str)
+        is_api_key = provider == "claude" and (
+            raw.get("kind") == "api_key" or isinstance(creds_obj, str)
+        )
         if is_api_key:
             if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
                 raise TransferError(
@@ -429,6 +513,7 @@ def import_accounts(
                 "uuid": raw.get("uuid", "") or "",
                 "added": raw.get("added") or get_timestamp(),
                 "kind": "api_key" if is_api_key else "oauth",
+                "provider": provider,
                 "alias": alias,
                 "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
@@ -469,8 +554,8 @@ def import_accounts(
             "sequence": [],
             "accounts": {},
         }
-        existing_slot = switcher._find_account_slot(
-            data, entry["email"], entry["org_uuid"]
+        existing_slot = _find_provider_slot(
+            data, entry["email"], entry["org_uuid"], entry["provider"]
         )
 
         if existing_slot is not None:
@@ -522,12 +607,17 @@ def import_accounts(
                 target_num = str(switcher._get_next_account_number())
             outcome = "imported"
 
-        switcher._write_account_credentials(
-            target_num, entry["email"], entry["creds_text"]
-        )
-        switcher._write_account_config(
-            target_num, entry["email"], entry["config_text"]
-        )
+        if entry["provider"] == "claude":
+            switcher._write_account_credentials(
+                target_num, entry["email"], entry["creds_text"]
+            )
+            switcher._write_account_config(
+                target_num, entry["email"], entry["config_text"]
+            )
+        else:
+            switcher._put_provider_material(
+                target_num, entry["email"], entry["creds_text"]
+            )
         # Every successful import write introduces credential material whose
         # previous auth verdict is no longer authoritative, so lift any
         # dead-token quarantine on this slot (mirrors add_account / the
@@ -550,6 +640,8 @@ def import_accounts(
         }
         if entry["kind"] == "api_key":
             new_record["kind"] = "api_key"
+        if entry["provider"] != "claude":
+            new_record["provider"] = entry["provider"]
         if entry.get("alias"):
             new_record["alias"] = entry["alias"]
         data["accounts"][target_num] = new_record

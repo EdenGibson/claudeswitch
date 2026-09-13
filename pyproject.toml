@@ -12,6 +12,7 @@ dependencies = [
     "keyring>=25.0.0; sys_platform == 'win32'",
     "textual>=8.2.8,<9",
     "truststore>=0.10.4",
+    "websockets>=15,<18",
 ]
 authors = [{name = "Onur Cetinkol", email = "onurcetinkol@gmail.com"}]
 license = {text = "MIT"}
@@ -33,6 +34,11 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
+# The router only. Keeps the core tool dependency-light for everyone who
+# never points Claude Code at a local backend.
+router = [
+    "aiohttp>=3.10",
+]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"

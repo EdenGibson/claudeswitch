@@ -22,6 +22,7 @@ References:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -209,3 +210,47 @@ def migrate_legacy_backup_dir(target: Path) -> bool:
         ) from exc
 
     return True
+
+
+#: Provider names may only be simple identifiers. The name becomes a directory
+#: under the backup root, so anything else could escape it.
+_PROVIDER_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
+
+
+def get_codex_home() -> Path:
+    """Return the Codex config directory (``CODEX_HOME`` or ``~/.codex``).
+
+    Mirrors the Codex CLI's own resolution, the same way
+    :func:`get_claude_config_home` mirrors Claude Code's.
+    """
+    env = os.environ.get("CODEX_HOME")
+    if env:
+        return Path(env)
+    return Path.home() / ".codex"
+
+
+def get_codex_auth_path() -> Path:
+    """Return the path to the Codex credentials file."""
+    return get_codex_home() / "auth.json"
+
+
+def get_router_root() -> Path:
+    """Return the cswap router's state directory.
+
+    Holds ``mode.json`` (which backend serves the next request) and
+    ``cliproxy-auth/`` (the one Codex credential CLIProxyAPI may use).
+    """
+    return get_backup_root() / "router"
+
+
+def get_provider_root(provider: str) -> Path:
+    """Return the cswap state root for a non-default provider.
+
+    Claude keeps the backup root itself, unchanged, so existing installs need
+    no migration. Every other provider gets ``<backup_root>/providers/<name>``.
+    """
+    # fullmatch, not match: "$" also matches before a final newline, so
+    # "codex\n" passed and resolved to a different directory than "codex".
+    if not _PROVIDER_NAME_RE.fullmatch(provider):
+        raise ValueError(f"invalid provider name: {provider!r}")
+    return get_backup_root() / "providers" / provider

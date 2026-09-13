@@ -25,6 +25,30 @@ jobs:
         run: uv sync --locked
 
       - name: Run tests
+        # Deliberately without --extra router: this job is also the proof that
+        # the core tool still installs and passes with no aiohttp, which is
+        # the promise the extra exists to keep. test-router covers the rest.
+        run: uv run pytest
+
+  test-router:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: uv sync --locked --extra router
+
+      - name: Run tests
+        # aiohttp is optional, so tests/test_router_server.py importorskips
+        # itself and the transport was going untested on every job. A separate
+        # job rather than an extra on the one above, so both install shapes
+        # stay covered.
         run: uv run pytest
 
   test-windows:
