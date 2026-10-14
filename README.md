@@ -164,6 +164,33 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 </details>
 
+### Remote Control with several accounts
+
+Claude Code's [Remote Control](https://code.claude.com/docs/en/remote-control) bridge keeps working for the account that was signed in when it started. If `cswap switch` or `cswap auto` changes the default login under a running bridge, requests the bridge makes on that account's behalf use the other account's token. Files attached from the phone app then fail to download.
+
+So don't run the bridge in your default profile. Give each account you use from the phone its own bridge:
+
+```bash
+cswap rc enable 1                # opt in; you sign in once, inside the account's own directory
+cswap rc enable 2
+cswap rc start --cwd ~/code -- --permission-mode acceptEdits   # args after '--' go to `claude remote-control`
+cswap rc status                  # each bridge's account, PID and health
+cswap rc stop
+```
+
+Whichever account the phone app is signed into, it sees that account's bridge. Switching and auto-switching only ever change your default `~/.claude` login. Neither touches a bridge directory, and `cswap switch` refuses to run inside one.
+
+<details>
+<summary>How it works & resource use</summary>
+
+- **Opt-in, per account.** Nothing changes until you run `cswap rc enable`. `cswap rc disable <num|email>` stops that account's bridge (`--purge` also deletes its directory). When an account is removed from cswap, its bridge and directory go with it. Directories are keyed by email + organization, not slot number, so `cswap swap` / `move` never disturb them.
+- **Its own login.** Each bridge directory gets a separate sign-in (`claude auth login` run inside it; `cswap rc login <num|email>` redoes it). It does not get a copy of cswap's stored credentials. OAuth refresh tokens rotate when used, so two places holding one token would knock each other out at the first refresh. A separate sign-in is a separate grant, like signing in on a second machine. Claude Code refreshes it in place, and cswap never reads or writes it.
+- **Your setup follows.** `skills/`, `commands/`, `agents/`, `plugins/` and `projects/` (transcripts and auto-memory) are linked to `~/.claude`. They are symlinks, or junctions on Windows, which need no special privilege. `settings.json`, `keybindings.json` and `CLAUDE.md` are symlinked, or on Windows without symlink rights, copied and re-synced every few seconds. Edit those in `~/.claude`, not from inside a bridge session. User-scope MCP servers, per-project trust and tool approvals are mirrored from `~/.claude.json`. `uploads/`, `sessions/` and `history.jsonl` stay per directory.
+- **Processes.** `cswap rc start` runs a single small supervisor (`cswap rc run` is the same thing in the foreground, for login scripts and service managers). It runs one `claude remote-control` per enabled, signed-in account and restarts a bridge 15s after it exits. Each bridge is one Claude Code process, plus one more per session you open from the phone. A bridge with no open sessions mostly sits idle. Only one supervisor runs per machine.
+- **Where.** `remote-control/` in the backup directory. Each account's bridge output goes to `bridge.log` in its directory.
+
+</details>
+
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
@@ -370,7 +397,7 @@ Codex credentials live under the backup directory in `providers/codex/credential
 `cswap run` profiles for Codex in `providers/codex/sessions/`. The accounts themselves are in
 the main `sequence.json`, alongside the Claude ones.
 
-Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
+Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Remote Control bridge directories (`cswap rc`) live in `remote-control/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 

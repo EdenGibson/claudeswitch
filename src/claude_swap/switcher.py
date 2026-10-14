@@ -5562,6 +5562,7 @@ class ClaudeAccountSwitcher:
         callbacks inside list_accounts() can re-acquire it.
         """
         warnings_out: list[str] = []
+        self._ensure_not_remote_control_dir()
         # Session-mode drift warning (warn, never block): switching the
         # default login to an account that also has a live session profile
         # puts the same refresh token in two config dirs — if the server
@@ -6049,6 +6050,24 @@ class ClaudeAccountSwitcher:
             data["accounts"][target_account].get("organizationUuid", ""),
         )
         return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+
+    def _ensure_not_remote_control_dir(self) -> None:
+        """Refuse to rewrite the login of a Remote Control bridge directory.
+
+        Those directories hold their own login (see ``remote_control``); a
+        switch run from inside a bridge session (``CLAUDE_CONFIG_DIR`` points
+        there) would swap the account under the live bridge — the exact
+        failure the directories exist to prevent.
+        """
+        from claude_swap.paths import get_claude_config_home
+        from claude_swap.remote_control import is_rc_config_dir
+
+        if is_rc_config_dir(self.backup_dir, get_claude_config_home()):
+            raise SwitchError(
+                "CLAUDE_CONFIG_DIR points at a Remote Control bridge directory; "
+                "cswap never switches the account there. Run the switch from a "
+                "normal terminal."
+            )
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active

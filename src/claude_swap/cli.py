@@ -334,6 +334,162 @@ def _unmap_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+def _rc_command(argv: list[str]) -> None:
+    """Handle `cswap rc enable|disable|login|start|run|stop|status`.
+
+    Per-account Remote Control bridges, each in its own config directory that
+    switching never touches. See ``claude_swap.remote_control``.
+    """
+    import time as _time
+
+    from claude_swap.remote_control import RemoteControlManager
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} rc",
+        description=(
+            "Run one Claude Code Remote Control bridge per opted-in account, "
+            "each in its own config directory with its own login, so account "
+            "switching never changes the account under a live bridge."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap rc enable 1                 # opt in; signs in once inside its directory
+  cswap rc enable user@example.com
+  cswap rc start --cwd ~/code -- --permission-mode acceptEdits
+  cswap rc status
+  cswap rc stop
+  cswap rc run                      # foreground supervisor (for login scripts)
+        """,
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    sub = parser.add_subparsers(dest="action", required=True)
+    p_enable = sub.add_parser("enable", help="opt an account in to its own bridge")
+    p_enable.add_argument("account", metavar="NUM|EMAIL|ALIAS")
+    p_enable.add_argument(
+        "--no-login",
+        action="store_true",
+        help="prepare the directory but sign in later with `cswap rc login`",
+    )
+    p_disable = sub.add_parser("disable", help="opt an account out (stops its bridge)")
+    p_disable.add_argument("account", metavar="NUM|EMAIL|ALIAS")
+    p_disable.add_argument(
+        "--purge",
+        action="store_true",
+        help="also delete the account's bridge directory and its login",
+    )
+    p_login = sub.add_parser(
+        "login", help="sign in inside an account's bridge directory"
+    )
+    p_login.add_argument("account", metavar="NUM|EMAIL|ALIAS")
+    for name, help_text in (
+        ("start", "start the supervisor in the background"),
+        ("run", "run the supervisor in the foreground"),
+    ):
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("--cwd", help="working directory for the bridges (saved)")
+        p.add_argument(
+            "bridge_args",
+            nargs=argparse.REMAINDER,
+            help="after '--': extra `claude remote-control` arguments (saved)",
+        )
+    sub.add_parser("stop", help="stop the supervisor and every bridge")
+    p_status = sub.add_parser(
+        "status", help="show each bridge's account, PID and health"
+    )
+    p_status.add_argument("--json", action="store_true", help="machine-readable output")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        rc = RemoteControlManager(switcher)
+
+        if args.action == "enable":
+            account = rc.enable(args.account, login=not args.no_login)
+            print(
+                f"{accent('Enabled')} Remote Control for Account-{account.number} "
+                f"({account.email})"
+            )
+            print(f"  {dimmed(str(account.rc_dir))}")
+            if args.no_login:
+                print(dimmed(f"  Sign in later with: cswap rc login {account.number}"))
+            if rc.supervisor_pid() is None:
+                print(dimmed("  Start the bridges with: cswap rc start"))
+        elif args.action == "disable":
+            account = rc.disable(args.account)
+            if args.purge:
+                rc.purge_when_stopped(account)
+            print(
+                f"{accent('Disabled')} Remote Control for {account.email}"
+                + (" (directory removed)" if args.purge else "")
+            )
+        elif args.action == "login":
+            account = rc.find_enabled(args.account)
+            rc.login(account)
+            print(f"{accent('Signed in')} {account.email} for Remote Control")
+        elif args.action in ("start", "run"):
+            extra = list(args.bridge_args or [])
+            if extra and extra[0] == "--":
+                extra = extra[1:]
+            cwd, bridge_args = rc.bridge_settings(
+                args.cwd, extra if args.bridge_args else None
+            )
+            if not rc.enabled_accounts():
+                error(
+                    "Error: no accounts are enabled for Remote Control. "
+                    "Run: cswap rc enable <num>"
+                )
+                sys.exit(1)
+            if args.action == "run":
+                sys.exit(rc.run_supervisor(cwd, bridge_args))
+            pid = rc.start_detached(
+                [sys.executable, "-m", "claude_swap", "rc"]
+                + (["--debug"] if args.debug else [])
+                + ["run"]
+            )
+            print(f"{accent('Started')} Remote Control supervisor (PID {pid})")
+            print(dimmed("  Check it with: cswap rc status"))
+        elif args.action == "stop":
+            if rc.supervisor_pid() is None:
+                print(dimmed("Remote Control supervisor is not running"))
+            elif rc.stop_supervisor():
+                print(f"{accent('Stopped')} Remote Control supervisor and its bridges")
+            else:
+                error("Error: the supervisor did not stop")
+                sys.exit(1)
+        elif args.action == "status":
+            data = rc.status()
+            if args.json:
+                print(json.dumps(data, indent=2))
+                return
+            sup = data["supervisor"]
+            print(
+                "Supervisor: "
+                + (f"running (PID {sup['pid']})" if sup["running"] else "stopped")
+            )
+            if not data["bridges"]:
+                print(dimmed("No accounts enabled. Run: cswap rc enable <num>"))
+            for row in data["bridges"]:
+                label = f"Account-{row['number']}" if row["number"] else "(removed)"
+                line = f"  {label} ({row['email']}): {row['health']}"
+                if row["pid"]:
+                    up = int(_time.time() - (row["startedAt"] or _time.time()))
+                    line += f", PID {row['pid']}, up {up // 3600}h{up % 3600 // 60:02d}m"
+                if row["restarts"]:
+                    line += f", {row['restarts']} restart(s)"
+                print(line)
+                note = row["detail"] if row["loggedIn"] else row["loginDetail"]
+                if note:
+                    print(f"    {dimmed(note)}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _swap_command(argv: list[str]) -> None:
     """Handle `cswap swap NUM|EMAIL|ALIAS NUM|EMAIL|ALIAS`.
 
@@ -894,6 +1050,9 @@ def main() -> None:
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
+    if argv and argv[0] == "rc":
+        _rc_command(argv[1:])
+        return
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
@@ -951,6 +1110,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s rc <cmd>                   per-account Remote Control bridges
   %(prog)s codex <cmd>                manage Codex (ChatGPT) accounts
   %(prog)s router <cmd>               local backend router (install/start/status)
   %(prog)s backend [claude|codex]     which backend answers running sessions
